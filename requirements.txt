@@ -1,0 +1,4 @@
+torch>=2.0
+numpy
+# Optional: required only when using --encoder transformer / bert / hf
+transformers>=4.30

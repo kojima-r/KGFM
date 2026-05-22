@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kgfm"
+version = "0.1.0"
+description = "Streaming text-relation prediction with trainable hashed n-gram embeddings or transformer encoders."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Ryosuke Kojima", email = "ryosuke.kojima@riken.jp" },
+]
+keywords = ["knowledge-graph", "relation-prediction", "distmult", "ngram", "transformer", "pytorch"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+transformer = [
+    "transformers>=4.30",
+]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+kgfm-train = "kgfm.train:main"
+kgfm-eval = "kgfm.eval:main"
+
+[project.urls]
+Homepage = "https://github.com/ryosuke-kojima/kgfm"
+Issues = "https://github.com/ryosuke-kojima/kgfm/issues"
+
+[tool.setuptools.packages.find]
+include = ["kgfm*"]
+exclude = ["checkpoints*", "data*", "list_*"]
