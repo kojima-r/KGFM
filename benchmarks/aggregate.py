@@ -43,6 +43,10 @@ def _row(record: Dict[str, Any]) -> Dict[str, str]:
     method = record.get("method", "?")
     encoder = record.get("encoder")
     if encoder:
+        # Distinguish frozen-LM rows so the table doesn't collapse them onto
+        # the fine-tuned cells of the same encoder.
+        if record.get("freeze_encoder"):
+            encoder = f"{encoder}, frozen"
         method = f"{method} ({encoder})"
     protocol = record.get("protocol", {}).get("type")
     if not protocol:

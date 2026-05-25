@@ -91,7 +91,12 @@ kgfm_ckpts/              # この実行の kgfm チェックポイント
 | `--max-train N` / `--max-valid N` / `--max-test N` | 50000 / 2000 / 2000 | ChEMBL prep の三つ組キャップ |
 | `--max-steps N` | 200 | kgfm の学習ステップ数 |
 | `--batch-size N` | 256 | kgfm の学習バッチサイズ |
-| `--protocol pooled\|filtered` | pooled | kgfm の最終評価プロトコル |
+| `--transformer-batch-size N` | （`--batch-size` と同じ） | transformer エンコーダ系のセルだけバッチサイズを上書き。BERT-base のフル fine-tune は B=1024 で OOM するため、こちらで個別に下げる |
+| `--proj-dim N` | （未指定 = `None`） | DistMult 直前に学習可能な `Linear` 射影を挿入。`--kgfm-freezes on` を使う場合は必須（凍結 LM + `proj_dim=None` だと学習可能パラメータが 0 になる）。ngram に対しても同値であれば `nn.Identity` に縮退するため無害 |
+| `--kgfm-protocols LIST` | `pooled,filtered` | 最終評価プロトコルのスイープ |
+| `--kgfm-encoders LIST` | `ngram,transformer` | エンコーダのスイープ |
+| `--kgfm-freezes LIST` | `off` | 凍結モードのスイープ。`off,on` を渡すと、各 transformer エンコーダについて「フル fine-tune」「凍結 + 射影頭のみ学習」の両方を回す。`ngram` の `on` 変種は no-op なので暗黙にスキップ |
+| `--protocol pooled\|filtered` | pooled | （単体実行時の互換用）kgfm の最終評価プロトコル |
 | `--max-filter-tails N` | 50000 | filtered 時の候補語彙上限 |
 | `--max-filter-rows N`  | 1000000 | filtered 時の読み取り行上限 |
 | `--ultra-gpus "<json>"` | `null` | ULTRA の GPU JSON (H200 では CPU 推奨) |
@@ -140,13 +145,33 @@ bash benchmarks/bootstrap_chembl_large.sh --max-train 7000000   # ~1% 相当
 
 | flag | `bootstrap_chembl.sh` | `bootstrap_chembl_large.sh` |
 |---|---|---|
-| `--max-train`         | 50,000    | **500,000** |
-| `--max-valid`         | 2,000     | **10,000** |
-| `--max-test`          | 2,000     | **10,000** |
-| `--max-steps`         | 200       | **2,000** |
-| `--batch-size`        | 256       | **1,024** |
-| `--max-filter-tails`  | 50,000    | **200,000** |
-| `--max-filter-rows`   | 1,000,000 | **5,000,000** |
+| `--max-train`              | 50,000    | **500,000** |
+| `--max-valid`              | 2,000     | **10,000** |
+| `--max-test`               | 2,000     | **10,000** |
+| `--max-steps`              | 200       | **2,000** |
+| `--batch-size`             | 256       | **1,024** |
+| `--transformer-batch-size` | (= `--batch-size`) | **64** |
+| `--proj-dim`               | (未指定) | **256** |
+| `--kgfm-freezes`           | `off`     | **`off,on`** |
+| `--max-filter-tails`       | 50,000    | **200,000** |
+| `--max-filter-rows`        | 1,000,000 | **5,000,000** |
+
+`bootstrap_chembl_large.sh` の transformer 関連デフォルトの意図:
+
+- **`--transformer-batch-size 64`**: `kgfm.model.DistMultScorer.encode_triple` は
+  `(h, r, t)` の 3 系列を 1 回の encoder forward にまとめるため、`B=1024` は
+  実質 `3072×128` の BERT-base 入力になり H200 (140GB) でも OOM します。
+  B=64 (実質 192 系列) であれば bf16 オートキャスト + AdamW 状態と合わせて
+  おおむね 60GB 程度に収まり安定して回ります。
+- **`--proj-dim 256`**: `--kgfm-freezes on` セルの学習に必須です。`proj_dim=None`
+  かつ encoder 凍結だと `nn.Identity` が射影層になり、optimizer に渡る
+  trainable パラメータが 0 になります。ngram (embedding_dim=256) では
+  そのまま Identity に縮退するので、結果としてはフル fine-tune セルへの
+  追加コストはありません。BERT の fine-tune セルは 768→256 の小さな射影を
+  経由する形になります。
+- **`--kgfm-freezes off,on`**: 同一 encoder を「フル fine-tune」と
+  「frozen + 射影のみ学習」で対比評価します。集計テーブルでは
+  `kgfm (transformer)` と `kgfm (transformer, frozen)` の 2 行に分かれます。
 
 下記は手動で個別に実行する場合のレシピです。
 

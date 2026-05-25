@@ -12,13 +12,16 @@
 # recent run. Each run dir contains:
 #   meta.json                          run parameters + host/git/torch info
 #   chembl_kg_stats.json               copy of prepared KG stats
-#   kgfm_<protocol>_<encoder>.json     one file per kgfm sweep cell
+#   kgfm_<protocol>_<encoder>[_frozen].json
+#                                      one file per kgfm sweep cell; the
+#                                      "_frozen" suffix is added when the
+#                                      cell was run with --freeze-encoder.
 #   ultra.json                         ULTRA metrics record
 #   motif.json                         MOTIF metrics record
 #   table.md                           aggregated comparison table
 #   run.log                            combined log
 #   <step>.log                         per-step logs
-#   kgfm_ckpts_<encoder>/              kgfm checkpoints (one tree per encoder)
+#   kgfm_ckpts_<encoder>[_frozen]/     kgfm checkpoints (one tree per cell)
 #
 # Setup steps (clone, conda env) are idempotent and re-run cheaply, so
 # the only skip flags are for the per-method work and the data prep.
@@ -32,12 +35,26 @@
 #   --max-test  N                                    (default 2000)
 #   --max-steps N          kgfm training steps       (default 200)
 #   --batch-size N         kgfm training batch size  (default 256)
+#   --transformer-batch-size N
+#                          Override --batch-size only for transformer-encoder
+#                          cells (BERT-base full fine-tune cannot fit B=1024
+#                          on a single GPU; default = same as --batch-size).
+#   --proj-dim N           Add a learnable Linear projection of this size
+#                          before scoring. Required when --kgfm-freezes
+#                          contains "on" (with proj_dim=None and a frozen
+#                          encoder, the optimizer has zero trainable params).
+#                          A no-op for ngram when N equals its embedding_dim.
 #   --kgfm-protocols LIST  Comma-separated kgfm final-eval protocols
 #                          (default "pooled,filtered"). Each value must
 #                          be one of pooled|filtered.
 #   --kgfm-encoders  LIST  Comma-separated kgfm encoders
 #                          (default "ngram,transformer"). Each value is
 #                          forwarded to run_kgfm.py --encoder.
+#   --kgfm-freezes   LIST  Comma-separated freeze modes (default "off").
+#                          Each value is one of off|on; "on" forwards
+#                          --freeze-encoder to run_kgfm.py. Only meaningful
+#                          for transformer encoders — for ngram the "on"
+#                          variant is silently skipped.
 #   --max-filter-tails N   filtered protocol vocab cap    (default 50000)
 #   --max-filter-rows  N   filtered protocol row cap      (default 1000000)
 #   --ultra-gpus  "..."    GPU JSON list for ULTRA   (default "null" — CPU,
@@ -64,8 +81,11 @@ MAX_VALID=2000
 MAX_TEST=2000
 MAX_STEPS=200
 BATCH_SIZE=256
+TRANSFORMER_BATCH_SIZE=""   # empty means: use $BATCH_SIZE for transformer cells too
+PROJ_DIM=""                 # empty means: don't pass --proj-dim (run_kgfm.py default: None)
 KGFM_PROTOCOLS="pooled,filtered"
 KGFM_ENCODERS="ngram,transformer"
+KGFM_FREEZES="off"
 MAX_FILTER_TAILS=50000
 MAX_FILTER_ROWS=1000000
 ULTRA_GPUS=null
@@ -87,8 +107,11 @@ while [[ $# -gt 0 ]]; do
         --max-test)          MAX_TEST=$2; shift 2 ;;
         --max-steps)         MAX_STEPS=$2; shift 2 ;;
         --batch-size)        BATCH_SIZE=$2; shift 2 ;;
+        --transformer-batch-size) TRANSFORMER_BATCH_SIZE=$2; shift 2 ;;
+        --proj-dim)          PROJ_DIM=$2; shift 2 ;;
         --kgfm-protocols)    KGFM_PROTOCOLS=$2; shift 2 ;;
         --kgfm-encoders)     KGFM_ENCODERS=$2; shift 2 ;;
+        --kgfm-freezes)      KGFM_FREEZES=$2; shift 2 ;;
         --max-filter-tails)  MAX_FILTER_TAILS=$2; shift 2 ;;
         --max-filter-rows)   MAX_FILTER_ROWS=$2; shift 2 ;;
         --ultra-gpus)        ULTRA_GPUS=$2; shift 2 ;;
@@ -131,6 +154,14 @@ TORCH_VERSION=$(python -c "import torch; print(torch.__version__)" 2>/dev/null |
 
 IFS=',' read -ra KGFM_PROTOCOL_ARR <<< "$KGFM_PROTOCOLS"
 IFS=',' read -ra KGFM_ENCODER_ARR  <<< "$KGFM_ENCODERS"
+IFS=',' read -ra KGFM_FREEZE_ARR   <<< "$KGFM_FREEZES"
+
+for f in "${KGFM_FREEZE_ARR[@]}"; do
+    case "$f" in
+        off|on) ;;
+        *) echo "Invalid --kgfm-freezes value: '$f' (use off|on)" >&2; exit 1 ;;
+    esac
+done
 
 # Render the bash arrays as JSON arrays for meta.json.
 json_array() {
@@ -145,6 +176,7 @@ json_array() {
 }
 KGFM_PROTOCOLS_JSON=$(json_array "${KGFM_PROTOCOL_ARR[@]}")
 KGFM_ENCODERS_JSON=$(json_array "${KGFM_ENCODER_ARR[@]}")
+KGFM_FREEZES_JSON=$(json_array "${KGFM_FREEZE_ARR[@]}")
 
 cat > "$OUT_DIR/meta.json" <<EOF
 {
@@ -162,8 +194,11 @@ cat > "$OUT_DIR/meta.json" <<EOF
     "max_test": $MAX_TEST,
     "max_steps": $MAX_STEPS,
     "batch_size": $BATCH_SIZE,
+    "transformer_batch_size": "${TRANSFORMER_BATCH_SIZE:-$BATCH_SIZE}",
+    "proj_dim": "${PROJ_DIM:-null}",
     "kgfm_protocols": $KGFM_PROTOCOLS_JSON,
     "kgfm_encoders": $KGFM_ENCODERS_JSON,
+    "kgfm_freezes": $KGFM_FREEZES_JSON,
     "max_filter_tails": $MAX_FILTER_TAILS,
     "max_filter_rows": $MAX_FILTER_ROWS,
     "ultra_gpus": "$ULTRA_GPUS",
@@ -180,7 +215,8 @@ log "    GPU        = $GPU_LINE"
 log "    torch      = $TORCH_VERSION  python = $PY_VERSION"
 log "    git_rev    = $GIT_REV (dirty=$GIT_DIRTY)"
 log "    params     = max_train=$MAX_TRAIN max_steps=$MAX_STEPS batch_size=$BATCH_SIZE"
-log "    kgfm sweep = protocols=[${KGFM_PROTOCOLS}] encoders=[${KGFM_ENCODERS}]"
+log "    transformer_batch_size=${TRANSFORMER_BATCH_SIZE:-$BATCH_SIZE} proj_dim=${PROJ_DIM:-<unset>}"
+log "    kgfm sweep = protocols=[${KGFM_PROTOCOLS}] encoders=[${KGFM_ENCODERS}] freezes=[${KGFM_FREEZES}]"
 log ""
 
 # ------------------------------- helpers ---------------------------------
@@ -231,30 +267,51 @@ cp -f "$HERE/chembl_kg/stats.json" "$OUT_DIR/chembl_kg_stats.json" 2>/dev/null |
 KGFM_FILES=()
 if [[ $SKIP_KGFM -eq 0 ]]; then
     for encoder in "${KGFM_ENCODER_ARR[@]}"; do
-        ckpt_dir="$OUT_DIR/kgfm_ckpts_${encoder}"
-        first=1
-        for protocol in "${KGFM_PROTOCOL_ARR[@]}"; do
-            out_name="kgfm_${protocol}_${encoder}.json"
-            step_name="run_kgfm_${protocol}_${encoder}"
-            extra_flags=()
-            if [[ $first -eq 0 ]]; then
-                # Reuse the checkpoint trained in this loop's first protocol.
-                extra_flags+=("--skip-train")
+        for freeze in "${KGFM_FREEZE_ARR[@]}"; do
+            # Freezing the ngram bag has no effect (no LM to freeze) and would
+            # produce a duplicate cell, so we silently skip it.
+            if [[ "$encoder" == "ngram" && "$freeze" == "on" ]]; then
+                log "skip kgfm cell encoder=ngram freeze=on (no LM to freeze)"
+                continue
             fi
-            run_step "$step_name" python "$HERE/run_kgfm.py" \
-                --encoder "$encoder" \
-                --max-steps "$MAX_STEPS" \
-                --batch-size "$BATCH_SIZE" \
-                --protocol "$protocol" \
-                --max-filter-tails "$MAX_FILTER_TAILS" \
-                --max-filter-rows "$MAX_FILTER_ROWS" \
-                --ckpt-dir "$ckpt_dir" \
-                --out "$OUT_DIR/$out_name" \
-                "${extra_flags[@]}" || true
-            if [[ -f "$OUT_DIR/$out_name" ]]; then
-                KGFM_FILES+=("$out_name")
+            tag="$encoder"
+            [[ "$freeze" == "on" ]] && tag="${encoder}_frozen"
+            ckpt_dir="$OUT_DIR/kgfm_ckpts_${tag}"
+            # Per-encoder batch-size override (BERT full FT cannot fit large B).
+            cell_batch_size=$BATCH_SIZE
+            if [[ "$encoder" != "ngram" && -n "$TRANSFORMER_BATCH_SIZE" ]]; then
+                cell_batch_size=$TRANSFORMER_BATCH_SIZE
             fi
-            first=0
+            first=1
+            for protocol in "${KGFM_PROTOCOL_ARR[@]}"; do
+                out_name="kgfm_${protocol}_${tag}.json"
+                step_name="run_kgfm_${protocol}_${tag}"
+                extra_flags=()
+                if [[ "$freeze" == "on" ]]; then
+                    extra_flags+=("--freeze-encoder")
+                fi
+                if [[ -n "$PROJ_DIM" ]]; then
+                    extra_flags+=("--proj-dim" "$PROJ_DIM")
+                fi
+                if [[ $first -eq 0 ]]; then
+                    # Reuse the checkpoint trained in this loop's first protocol.
+                    extra_flags+=("--skip-train")
+                fi
+                run_step "$step_name" python "$HERE/run_kgfm.py" \
+                    --encoder "$encoder" \
+                    --max-steps "$MAX_STEPS" \
+                    --batch-size "$cell_batch_size" \
+                    --protocol "$protocol" \
+                    --max-filter-tails "$MAX_FILTER_TAILS" \
+                    --max-filter-rows "$MAX_FILTER_ROWS" \
+                    --ckpt-dir "$ckpt_dir" \
+                    --out "$OUT_DIR/$out_name" \
+                    "${extra_flags[@]}" || true
+                if [[ -f "$OUT_DIR/$out_name" ]]; then
+                    KGFM_FILES+=("$out_name")
+                fi
+                first=0
+            done
         done
     done
 else

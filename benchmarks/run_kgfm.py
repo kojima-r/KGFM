@@ -179,6 +179,9 @@ def main() -> None:
     out = {
         "method": "kgfm",
         "encoder": args.encoder,
+        "freeze_encoder": bool(args.freeze_encoder),
+        "proj_dim": args.proj_dim,
+        "batch_size": args.batch_size,
         "ckpt": best_ckpt,
         "train_seconds": None if args.skip_train else round(train_seconds, 1),
         "metrics": metrics,
