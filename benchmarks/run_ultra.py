@@ -52,6 +52,10 @@ DEFAULT_ENV_NAME = "kgfm-ultra"
 _SHIM_MARKER = "# === BEGIN benchmarks/run_ultra.py injection (ChEMBLCustom) ==="
 _SHIM_END = "# === END benchmarks/run_ultra.py injection ==="
 
+# Sentinel used to detect a previous injection in script/run.py.
+_RUNPY_MARKER = "# === BEGIN benchmarks/run_ultra.py injection (test_count) ==="
+_RUNPY_END = "# === END benchmarks/run_ultra.py injection (test_count) ==="
+
 
 def _shim_source(data_root_abs: str) -> str:
     return f'''
@@ -128,6 +132,8 @@ _METRIC_RE = re.compile(
     r"(mrr|hits@1|hits@3|hits@10|mr)\s*[:=]\s*([0-9eE+\-.]+)",
     re.IGNORECASE,
 )
+# Emitted by the injected log line in script/run.py (see _inject_test_count).
+_COUNT_RE = re.compile(r"#test_triplets:\s*(\d+)")
 
 
 def _parse_metrics(output: str) -> dict:
@@ -139,7 +145,48 @@ def _parse_metrics(output: str) -> dict:
             found[key] = float(m.group(2))
         except ValueError:
             pass
+    counts = _COUNT_RE.findall(output)
+    if counts:
+        # Upstream calls test() twice (valid then test) — the last log line
+        # corresponds to the test split.
+        found["n"] = int(counts[-1])
     return found
+
+
+def _inject_test_count(ultra_dir: str) -> None:
+    """Patch ``script/run.py`` so it logs ``#test_triplets: N`` per split.
+
+    Idempotent; mirrors the dataset shim's strip-and-re-inject pattern so a
+    re-run picks up any template change.
+    """
+    path = os.path.join(ultra_dir, "script", "run.py")
+    with open(path, "r") as f:
+        content = f.read()
+
+    # Strip any prior injection (including its leading indent and trailing
+    # newline) before re-adding.
+    while _RUNPY_MARKER in content:
+        marker_at = content.index(_RUNPY_MARKER)
+        start = content.rfind("\n", 0, marker_at) + 1
+        end_marker = content.index(_RUNPY_END, marker_at)
+        end_line = content.index("\n", end_marker) + 1
+        content = content[:start] + content[end_line:]
+
+    needle = (
+        "    test_triplets = torch.cat([test_data.target_edge_index,"
+        " test_data.target_edge_type.unsqueeze(0)]).t()\n"
+    )
+    if needle in content:
+        insert = (
+            f"    {_RUNPY_MARKER}\n"
+            f"    if rank == 0:\n"
+            f'        logger.warning("#test_triplets: %d" % len(test_triplets))\n'
+            f"    {_RUNPY_END}\n"
+        )
+        content = content.replace(needle, needle + insert, 1)
+
+    with open(path, "w") as f:
+        f.write(content)
 
 
 def _conda_base() -> Optional[str]:
@@ -260,6 +307,8 @@ def main() -> None:
     data_root_abs = os.path.abspath(args.data_root)
     print(f"[ultra] injecting ChEMBLCustom into {args.ultra_dir}/ultra/datasets.py")
     _inject_shim(args.ultra_dir, data_root_abs)
+    print(f"[ultra] injecting test-count logger into {args.ultra_dir}/script/run.py")
+    _inject_test_count(args.ultra_dir)
 
     cmd = [
         env_python, "script/run.py",

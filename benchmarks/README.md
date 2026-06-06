@@ -290,6 +290,76 @@ MRR / Hit@1 / Hit@3 / Hit@10 / nDCG を比較する Markdown テーブルが
 
 ---
 
+## test サンプル数 (`n_eval`) と評価指標への影響
+
+`aggregate.py` の出力テーブルにある `n_eval` 列は、各手法が実際に評価に
+使った test 三つ組数です。**手法ごとに収集方法が異なるので、数字を
+そのまま横並びで比較しないでください。**
+
+### `n_eval` の中身 (手法ごと)
+
+| 手法 | `n_eval` の定義 | 上限 |
+|---|---|---|
+| `kgfm` | **tail 方向のみ**にストリーミング評価したカウント (`kgfm/eval.py` の `n`) | `--n-eval-triples` (`run_kgfm.py` 既定 **5000**) で打ち切り |
+| `ULTRA` | `script/run.py` の `test()` に渡る `len(test_triplets)` = `test.txt` の全行数 | `--max-test` (`prepare_chembl_kg.py`) |
+| `MOTIF` | 同上 | 同上 |
+
+ULTRA / MOTIF は head 方向と tail 方向の両方で順位付けして平均するため、
+MRR / Hit@K の **分母は実質 `2 × n_eval`** です。kgfm は tail 片方向のみ
+なので分母は `n_eval` そのものになります。
+
+### サンプリングが指標に与えるバイアス
+
+- **標本誤差 (共通)** — `n_eval` が 2,000 オーダーだと信頼区間はかなり
+  広く、MRR ≈ 0.10〜0.20 のレンジで標準誤差は ±0.005〜±0.010 (95%CI
+  でおおよそ ±0.01〜±0.02) 程度です。**手法間の差が 1〜2 ポイント以内
+  なら有意とは主張できません。** `bootstrap_chembl_large.sh`
+  (`--max-test 10000`) ならおおむね √5 倍狭まります。
+- **kgfm の打ち切り (`--n-eval-triples`)** — `run_kgfm.py` の既定は
+  **5,000** です。`bootstrap_chembl_large.sh` のように `--max-test 10000`
+  で test ファイルを大きくしても、kgfm 側は 5,000 で評価を打ち切ります
+  (ULTRA / MOTIF は test 全件を評価)。test 全件で kgfm を回したい場合は
+  `--n-eval-triples >= --max-test` を明示してください。なお
+  `bootstrap_chembl.sh` の既定 (`--max-test 2000 < 5000`) では test
+  ファイルが先に尽きるため、この打ち切りは発動しません。
+- **kgfm 評価対象のシャッフル** — `kgfm/eval.py` の
+  `StreamingTripleDataset` はファイル順をシャッフルしバッファ内も
+  shuffle しますが、ChEMBL の TSV はファイル境界で activity ID
+  (したがって関係タイプ) が偏ります。`--n-eval-triples` を `--max-test`
+  より小さくすると **関係タイプ分布が test 全体と乖離** することが
+  あるので注意してください。
+- **filtered プロトコルの `--max-filter-tails` / `--max-filter-rows`** —
+  これらを絞ると `kgfm` の filtered 評価には 2 つの相反する効果が出ます。
+  - (a) tail 候補語彙が小さくなる → ランキング分母が縮むので **MRR は
+    楽観方向**。
+  - (b) 同じ `(h, r)` の他の正解 tail を `-inf` でマスクしきれない →
+    real positive が distractor に混ざるので **MRR は悲観方向**。
+
+  ULTRA / MOTIF は全エンティティに対する filtered ranking なので
+  これらの上限を持ちません。手法間比較を厳密にやる場合は
+  `--max-filter-tails ≈ |E|`、`--max-filter-rows ≈ |train+valid+test 合計
+  行数|` 程度を取り、(a)(b) いずれも実質発動しない領域で走らせるか、
+  もしくは `--protocol pooled` で揃えてください (pooled なら
+  `pool_size` が 3 手法とも同じ意味になります)。
+- **`prepare_chembl_kg.py --max-test`** — これは 3 手法共通の上限です
+  (test.txt のサイズそのもの)。ここを大きくすれば 3 手法とも信頼区間が
+  同じだけ狭まります。kgfm の `--n-eval-triples` だけ大きくしても、
+  `--max-test` で先に切られた test ファイルより多くは評価できません。
+
+### 実務上のガイドライン
+
+- 公開できる数値を出すときは少なくとも `bootstrap_chembl_large.sh`
+  水準 (`--max-test 10000`、可能なら `--max-test 50000` 以上) で取り、
+  `--n-eval-triples` を `--max-test` 以上に設定してください。
+- 手法間で差を主張する場合は、`table.md` の `n_eval` と Protocol が
+  揃っていることを確認した上で、差が標本誤差を上回るか併記してください。
+- kgfm を filtered で評価する場合、`--max-filter-tails` ≈ `|E|`、
+  `--max-filter-rows` ≈ `|train+valid+test 合計行数|` を目安に、
+  「フィルタが完全」「候補集合が全エンティティ」の状態に持っていくのが
+  ULTRA / MOTIF と最もフェアな比較条件です。
+
+---
+
 ## 動作確認時の実測値 (簡易版)
 
 このマシンでの動作確認時の数値です。あくまで小規模スモーク条件ですが、
