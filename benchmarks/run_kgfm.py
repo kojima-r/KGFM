@@ -28,6 +28,19 @@ from kgfm.train import TrainConfig, train as kgfm_train  # noqa: E402
 from kgfm.utils import pick_free_gpu  # noqa: E402
 
 
+def _is_main_rank() -> bool:
+    """True for the rank-0 process under torchrun, else True (single-process)."""
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def _eval_batch_size(args) -> int:
+    """Per-device eval batch size, defaulting to max(64, train_bs // 2)."""
+    if getattr(args, "per_device_eval_batch_size", None):
+        return int(args.per_device_eval_batch_size)
+    train_bs = getattr(args, "per_device_train_batch_size", None) or args.batch_size
+    return max(64, train_bs // 2)
+
+
 def _build_config(args) -> TrainConfig:
     return TrainConfig(
         train_list=args.train_list,
@@ -39,6 +52,9 @@ def _build_config(args) -> TrainConfig:
         transformer_model=args.transformer_model,
         freeze_encoder=args.freeze_encoder,
         batch_size=args.batch_size,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_workers=args.num_workers,
         max_steps=args.max_steps,
         log_every=args.log_every,
@@ -50,12 +66,18 @@ def _build_config(args) -> TrainConfig:
         ckpt_dir=args.ckpt_dir,
         ckpt_every=args.ckpt_every,
         seed=args.seed,
+        resume=args.resume,
+        resume_from_ckpt=args.resume_from_ckpt,
     )
 
 
 def _final_eval(ckpt_path: str, test_list: str, args) -> dict:
     """Reload the best checkpoint and run a fresh evaluation pass."""
-    device = pick_free_gpu()
+    # Under torchrun, pin to LOCAL_RANK's GPU instead of racing pick_free_gpu().
+    if "LOCAL_RANK" in os.environ and torch.cuda.is_available():
+        device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    else:
+        device = pick_free_gpu()
     ckpt = torch.load(ckpt_path, map_location=device)
     cfg = ckpt.get("config", {}) or {}
     encoder = make_encoder(
@@ -97,7 +119,7 @@ def _final_eval(ckpt_path: str, test_list: str, args) -> dict:
         filter_files=filter_files,
         max_filter_tails=args.max_filter_tails,
         max_filter_rows=args.max_filter_rows,
-        batch_size=max(64, args.batch_size // 2),
+        batch_size=_eval_batch_size(args),
         num_workers=max(1, args.num_workers // 2),
         seed=args.seed,
     )
@@ -114,7 +136,22 @@ def main() -> None:
     p.add_argument("--freeze-encoder", action="store_true")
     p.add_argument("--embedding-dim", type=int, default=256)
     p.add_argument("--proj-dim", type=int, default=None)
-    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--batch-size", type=int, default=256,
+                   help="Per-device micro-batch size. Backwards-compatible "
+                        "alias for --per-device-train-batch-size.")
+    p.add_argument("--per-device-train-batch-size", type=int, default=None,
+                   help="HF-style per-GPU micro-batch size. Effective global "
+                        "batch size = per_device_train_batch_size * "
+                        "world_size * gradient_accumulation_steps.")
+    p.add_argument("--per-device-eval-batch-size", type=int, default=None,
+                   help="Per-GPU eval batch size. Used by both in-loop "
+                        "validation and the final eval. Defaults to "
+                        "max(64, per_device_train_batch_size // 2).")
+    p.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                   help="Number of forward/backward passes per optimizer "
+                        "step under DDP. Multiplied with world_size and "
+                        "per_device_train_batch_size to get the effective "
+                        "global batch size.")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--max-steps", type=int, default=5000)
     p.add_argument("--log-every", type=int, default=50)
@@ -146,9 +183,20 @@ def main() -> None:
     p.add_argument("--out", default="benchmarks/results/kgfm.json")
     p.add_argument("--skip-train", action="store_true",
                    help="Skip training; only run final eval on the existing best ckpt.")
+    p.add_argument("--resume", action="store_true",
+                   help="If --ckpt-dir already contains a checkpoint "
+                        "(final.pt > last.pt > best.pt), load it and "
+                        "continue training from its saved step up to "
+                        "--max-steps. A no-op when no checkpoint is "
+                        "present, and a training-skip when the saved "
+                        "step has already reached --max-steps.")
+    p.add_argument("--resume-from-ckpt", default=None,
+                   help="Explicit checkpoint path to resume from. "
+                        "Overrides the --resume auto-detect.")
     args = p.parse_args()
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    if _is_main_rank():
+        os.makedirs(os.path.dirname(args.out), exist_ok=True)
 
     t0 = time.time()
     if not args.skip_train:
@@ -156,11 +204,23 @@ def main() -> None:
         kgfm_train(cfg)
     train_seconds = time.time() - t0
 
-    best_ckpt = os.path.join(args.ckpt_dir, "best.pt")
-    if not os.path.exists(best_ckpt):
-        # Fall back to the final ckpt if no validation set produced a "best".
-        best_ckpt = os.path.join(args.ckpt_dir, "final.pt")
-    if not os.path.exists(best_ckpt):
+    # Final eval + JSON write are inherently single-process: the checkpoint
+    # produced by training is identical on every rank, so re-running eval on
+    # all ranks would just race on the output file.
+    if not _is_main_rank():
+        return
+
+    # Preference order: best (highest valid MRR) > final (end of run) >
+    # last (most recent ckpt_every snapshot). The fall-through to last.pt
+    # matters for resuming an interrupted run that wrote ckpts but never
+    # got to validation / training completion.
+    best_ckpt = None
+    for tag in ("best.pt", "final.pt", "last.pt"):
+        candidate = os.path.join(args.ckpt_dir, tag)
+        if os.path.exists(candidate):
+            best_ckpt = candidate
+            break
+    if best_ckpt is None:
         sys.exit(f"No checkpoint found under {args.ckpt_dir}.")
 
     metrics = _final_eval(best_ckpt, args.test_list, args)
@@ -182,6 +242,10 @@ def main() -> None:
         "freeze_encoder": bool(args.freeze_encoder),
         "proj_dim": args.proj_dim,
         "batch_size": args.batch_size,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "per_device_eval_batch_size": args.per_device_eval_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
         "ckpt": best_ckpt,
         "train_seconds": None if args.skip_train else round(train_seconds, 1),
         "metrics": metrics,

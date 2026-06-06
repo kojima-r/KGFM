@@ -1,4 +1,7 @@
 torch>=2.0
 numpy
-# Optional: required only when using --encoder transformer / bert / hf
-transformers>=4.30
+# Optional: required only when using --encoder transformer / bert / hf.
+# Cap at 4.x because transformers 5.x requires torch>=2.7 (uses
+# torch.float8_e8m0fnu), and the benchmark env pins torch==2.5.1 for
+# ULTRA's rspmm CUDA extension.
+transformers>=4.30,<5.0

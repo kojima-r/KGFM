@@ -34,7 +34,27 @@
 #   --max-valid N                                    (default 2000)
 #   --max-test  N                                    (default 2000)
 #   --max-steps N          kgfm training steps       (default 200)
-#   --batch-size N         kgfm training batch size  (default 256)
+#   --batch-size N         kgfm per-device micro-batch size (default 256).
+#                          Backwards-compatible alias for
+#                          --per-device-train-batch-size; under DDP this
+#                          is per GPU, not global.
+#   --per-device-train-batch-size N
+#                          HF-style per-GPU micro-batch size. When set,
+#                          overrides --batch-size. Effective global batch
+#                          size = per_device_train * kgfm_nproc *
+#                          gradient_accumulation_steps.
+#   --per-device-eval-batch-size N
+#                          Per-GPU eval batch size, used by the in-loop
+#                          validation and final test pass. Defaults to
+#                          max(64, per_device_train // 2).
+#   --gradient-accumulation-steps N
+#                          Number of micro-batches accumulated per
+#                          optimizer step (default 1).
+#   --kgfm-nproc N         How many GPUs (= processes) to launch per kgfm
+#                          cell via torchrun. Default 1 (no DDP). When
+#                          >1 the script invokes
+#                          `torchrun --nproc-per-node=N run_kgfm.py ...`.
+#   --kgfm-master-port P   torchrun --master-port. Default 29500.
 #   --transformer-batch-size N
 #                          Override --batch-size only for transformer-encoder
 #                          cells (BERT-base full fine-tune cannot fit B=1024
@@ -68,6 +88,33 @@
 #   --skip-ultra           Skip run_ultra.py
 #   --skip-motif           Skip run_motif.py
 #   --skip-aggregate       Skip aggregate.py
+#   --resume [TS|PATH]     Resume an interrupted run instead of starting a
+#                          fresh one. Reuses the existing results directory
+#                          (and its meta.json / checkpoints) and skips any
+#                          step whose output file is already present.
+#                          - With no argument: resumes the run pointed to by
+#                            benchmarks/results/chembl/latest.
+#                          - With a bare timestamp (e.g. 20260507T155834Z):
+#                            resumes benchmarks/results/chembl/<TS>.
+#                          - With an absolute or relative path: resumes that
+#                            directory directly.
+#                          Per-step resume rules:
+#                            prep    skipped if chembl_kg_stats.json exists
+#                            kgfm    a cell's protocol is skipped if its
+#                                    kgfm_*.json exists; otherwise the
+#                                    first protocol that runs for the cell
+#                                    is launched with --resume so train.py
+#                                    auto-loads the latest checkpoint
+#                                    (final.pt > last.pt > best.pt) and
+#                                    continues training up to --max-steps.
+#                                    Already-finished training (saved step
+#                                    >= max-steps) skips the loop and just
+#                                    re-runs eval. Resume applies to kgfm
+#                                    only — ULTRA / MOTIF have no training
+#                                    state and are still pure file-skip.
+#                            ultra   skipped if ultra.json exists
+#                            motif   skipped if motif.json exists
+#                            aggregate always re-runs (cheap, picks up new files)
 #   -h, --help             Show this header.
 set -eo pipefail
 
@@ -81,6 +128,11 @@ MAX_VALID=2000
 MAX_TEST=2000
 MAX_STEPS=200
 BATCH_SIZE=256
+PER_DEVICE_TRAIN_BS=""      # empty means: use $BATCH_SIZE
+PER_DEVICE_EVAL_BS=""       # empty means: max(64, per_device_train_bs // 2)
+GRAD_ACCUM_STEPS=1
+KGFM_NPROC=1                # 1 = single-process; >1 = launch via torchrun
+KGFM_MASTER_PORT=29500
 TRANSFORMER_BATCH_SIZE=""   # empty means: use $BATCH_SIZE for transformer cells too
 PROJ_DIM=""                 # empty means: don't pass --proj-dim (run_kgfm.py default: None)
 KGFM_PROTOCOLS="pooled,filtered"
@@ -97,6 +149,8 @@ SKIP_KGFM=0
 SKIP_ULTRA=0
 SKIP_MOTIF=0
 SKIP_AGGREGATE=0
+RESUME=0
+RESUME_TARGET=""
 
 show_help() { sed -n '2,/^set -eo pipefail/p' "$0" | sed 's/^# //; s/^#//' | head -n -1; }
 
@@ -107,6 +161,11 @@ while [[ $# -gt 0 ]]; do
         --max-test)          MAX_TEST=$2; shift 2 ;;
         --max-steps)         MAX_STEPS=$2; shift 2 ;;
         --batch-size)        BATCH_SIZE=$2; shift 2 ;;
+        --per-device-train-batch-size) PER_DEVICE_TRAIN_BS=$2; shift 2 ;;
+        --per-device-eval-batch-size)  PER_DEVICE_EVAL_BS=$2; shift 2 ;;
+        --gradient-accumulation-steps) GRAD_ACCUM_STEPS=$2; shift 2 ;;
+        --kgfm-nproc)        KGFM_NPROC=$2; shift 2 ;;
+        --kgfm-master-port)  KGFM_MASTER_PORT=$2; shift 2 ;;
         --transformer-batch-size) TRANSFORMER_BATCH_SIZE=$2; shift 2 ;;
         --proj-dim)          PROJ_DIM=$2; shift 2 ;;
         --kgfm-protocols)    KGFM_PROTOCOLS=$2; shift 2 ;;
@@ -123,16 +182,46 @@ while [[ $# -gt 0 ]]; do
         --skip-ultra)        SKIP_ULTRA=1; shift ;;
         --skip-motif)        SKIP_MOTIF=1; shift ;;
         --skip-aggregate)    SKIP_AGGREGATE=1; shift ;;
+        --resume)
+            RESUME=1
+            # Accept an optional argument. Anything that doesn't start with "--"
+            # is treated as the resume target (timestamp or path); otherwise
+            # we default to "latest".
+            if [[ $# -ge 2 && "$2" != --* ]]; then
+                RESUME_TARGET=$2; shift 2
+            else
+                RESUME_TARGET="latest"; shift
+            fi
+            ;;
         -h|--help)           show_help; exit 0 ;;
         *) echo "Unknown flag: $1" >&2; echo "Try --help" >&2; exit 1 ;;
     esac
 done
 
 # ------------------------------- run dir ---------------------------------
-TS=$(date -u +%Y%m%dT%H%M%SZ)
-OUT_DIR="$HERE/results/chembl/$TS"
-mkdir -p "$OUT_DIR"
-ln -sfn "$TS" "$HERE/results/chembl/latest"
+if [[ $RESUME -eq 1 ]]; then
+    # Resolve RESUME_TARGET into an absolute OUT_DIR. Accepted forms:
+    #   "latest"                              -> follow the latest symlink
+    #   "20260507T155834Z"                    -> $HERE/results/chembl/<ts>
+    #   "/abs/path" or "rel/path"             -> taken verbatim
+    if [[ "$RESUME_TARGET" == /* || "$RESUME_TARGET" == */* ]]; then
+        OUT_DIR="$RESUME_TARGET"
+    else
+        OUT_DIR="$HERE/results/chembl/$RESUME_TARGET"
+    fi
+    if [[ ! -d "$OUT_DIR" ]]; then
+        echo "Resume target not found: $OUT_DIR" >&2
+        exit 1
+    fi
+    # Follow symlinks so $TS reflects the underlying directory name.
+    OUT_DIR=$(cd "$OUT_DIR" && pwd -P)
+    TS=$(basename "$OUT_DIR")
+else
+    TS=$(date -u +%Y%m%dT%H%M%SZ)
+    OUT_DIR="$HERE/results/chembl/$TS"
+    mkdir -p "$OUT_DIR"
+    ln -sfn "$TS" "$HERE/results/chembl/latest"
+fi
 
 LOG="$OUT_DIR/run.log"
 log()       { printf '[%(%H:%M:%S)T] %s\n' -1 "$*" | tee -a "$LOG" ; }
@@ -178,7 +267,8 @@ KGFM_PROTOCOLS_JSON=$(json_array "${KGFM_PROTOCOL_ARR[@]}")
 KGFM_ENCODERS_JSON=$(json_array "${KGFM_ENCODER_ARR[@]}")
 KGFM_FREEZES_JSON=$(json_array "${KGFM_FREEZE_ARR[@]}")
 
-cat > "$OUT_DIR/meta.json" <<EOF
+if [[ $RESUME -eq 0 || ! -f "$OUT_DIR/meta.json" ]]; then
+    cat > "$OUT_DIR/meta.json" <<EOF
 {
   "benchmark": "chembl",
   "timestamp_utc": "$TS",
@@ -194,6 +284,10 @@ cat > "$OUT_DIR/meta.json" <<EOF
     "max_test": $MAX_TEST,
     "max_steps": $MAX_STEPS,
     "batch_size": $BATCH_SIZE,
+    "per_device_train_batch_size": "${PER_DEVICE_TRAIN_BS:-null}",
+    "per_device_eval_batch_size": "${PER_DEVICE_EVAL_BS:-null}",
+    "gradient_accumulation_steps": $GRAD_ACCUM_STEPS,
+    "kgfm_nproc": $KGFM_NPROC,
     "transformer_batch_size": "${TRANSFORMER_BATCH_SIZE:-$BATCH_SIZE}",
     "proj_dim": "${PROJ_DIM:-null}",
     "kgfm_protocols": $KGFM_PROTOCOLS_JSON,
@@ -208,14 +302,21 @@ cat > "$OUT_DIR/meta.json" <<EOF
   }
 }
 EOF
+fi
 
-log "==> bootstrap_chembl.sh"
+if [[ $RESUME -eq 1 ]]; then
+    log "==> bootstrap_chembl.sh (RESUME mode)"
+else
+    log "==> bootstrap_chembl.sh"
+fi
 log "    OUT_DIR    = $OUT_DIR"
 log "    GPU        = $GPU_LINE"
 log "    torch      = $TORCH_VERSION  python = $PY_VERSION"
 log "    git_rev    = $GIT_REV (dirty=$GIT_DIRTY)"
 log "    params     = max_train=$MAX_TRAIN max_steps=$MAX_STEPS batch_size=$BATCH_SIZE"
 log "    transformer_batch_size=${TRANSFORMER_BATCH_SIZE:-$BATCH_SIZE} proj_dim=${PROJ_DIM:-<unset>}"
+log "    per_device_train_batch_size=${PER_DEVICE_TRAIN_BS:-<unset>} per_device_eval_batch_size=${PER_DEVICE_EVAL_BS:-<unset>}"
+log "    gradient_accumulation_steps=$GRAD_ACCUM_STEPS kgfm_nproc=$KGFM_NPROC master_port=$KGFM_MASTER_PORT"
 log "    kgfm sweep = protocols=[${KGFM_PROTOCOLS}] encoders=[${KGFM_ENCODERS}] freezes=[${KGFM_FREEZES}]"
 log ""
 
@@ -247,17 +348,20 @@ else
 fi
 
 # ----------------------- 3) prepare ChEMBL KG ----------------------------
-if [[ $SKIP_PREP -eq 0 ]]; then
+if [[ $RESUME -eq 1 && -f "$OUT_DIR/chembl_kg_stats.json" ]]; then
+    log "skip prepare_chembl_kg (resume: $OUT_DIR/chembl_kg_stats.json exists)"
+elif [[ $SKIP_PREP -eq 0 ]]; then
     rm -rf "$HERE/chembl_kg/processed" "$HERE/chembl_kg/processed_motif" 2>/dev/null || true
     run_step prepare_chembl_kg python "$HERE/prepare_chembl_kg.py" \
         --max-train "$MAX_TRAIN" \
         --max-valid "$MAX_VALID" \
         --max-test "$MAX_TEST" \
         --out-dir "$HERE/chembl_kg" || true
+    cp -f "$HERE/chembl_kg/stats.json" "$OUT_DIR/chembl_kg_stats.json" 2>/dev/null || true
 else
     log "skip prepare_chembl_kg (--skip-prep) — using existing $HERE/chembl_kg"
+    cp -f "$HERE/chembl_kg/stats.json" "$OUT_DIR/chembl_kg_stats.json" 2>/dev/null || true
 fi
-cp -f "$HERE/chembl_kg/stats.json" "$OUT_DIR/chembl_kg_stats.json" 2>/dev/null || true
 
 # --------------------------- 4) kgfm sweep -------------------------------
 # For each encoder we train once, then re-evaluate the resulting checkpoint
@@ -282,10 +386,21 @@ if [[ $SKIP_KGFM -eq 0 ]]; then
             if [[ "$encoder" != "ngram" && -n "$TRANSFORMER_BATCH_SIZE" ]]; then
                 cell_batch_size=$TRANSFORMER_BATCH_SIZE
             fi
-            first=1
+            # Within one (encoder, freeze) cell every protocol shares the
+            # same checkpoint — only the first protocol that actually runs
+            # triggers training (or resumes it under --resume); subsequent
+            # protocols re-evaluate the produced ckpt with --skip-train.
+            # `cell_trained_yet` tracks whether the per-cell training pass
+            # has already been launched in this script invocation.
+            cell_trained_yet=0
             for protocol in "${KGFM_PROTOCOL_ARR[@]}"; do
                 out_name="kgfm_${protocol}_${tag}.json"
                 step_name="run_kgfm_${protocol}_${tag}"
+                if [[ $RESUME -eq 1 && -f "$OUT_DIR/$out_name" ]]; then
+                    log "skip $step_name (resume: $out_name exists)"
+                    KGFM_FILES+=("$out_name")
+                    continue
+                fi
                 extra_flags=()
                 if [[ "$freeze" == "on" ]]; then
                     extra_flags+=("--freeze-encoder")
@@ -293,11 +408,38 @@ if [[ $SKIP_KGFM -eq 0 ]]; then
                 if [[ -n "$PROJ_DIM" ]]; then
                     extra_flags+=("--proj-dim" "$PROJ_DIM")
                 fi
-                if [[ $first -eq 0 ]]; then
-                    # Reuse the checkpoint trained in this loop's first protocol.
-                    extra_flags+=("--skip-train")
+                if [[ -n "$PER_DEVICE_TRAIN_BS" ]]; then
+                    extra_flags+=("--per-device-train-batch-size" "$PER_DEVICE_TRAIN_BS")
                 fi
-                run_step "$step_name" python "$HERE/run_kgfm.py" \
+                if [[ -n "$PER_DEVICE_EVAL_BS" ]]; then
+                    extra_flags+=("--per-device-eval-batch-size" "$PER_DEVICE_EVAL_BS")
+                fi
+                if [[ "$GRAD_ACCUM_STEPS" != "1" ]]; then
+                    extra_flags+=("--gradient-accumulation-steps" "$GRAD_ACCUM_STEPS")
+                fi
+                launcher=(python)
+                if [[ $cell_trained_yet -eq 1 ]]; then
+                    # An earlier protocol already trained this cell.
+                    # Just re-score on the resulting ckpt.
+                    extra_flags+=("--skip-train")
+                else
+                    # First protocol to run for this cell — owns the
+                    # training pass. In resume mode, ask run_kgfm.py to
+                    # pick up any existing ckpt and continue from its
+                    # saved step up to --max-steps; if no ckpt is there
+                    # train.py just trains from scratch as usual.
+                    if [[ $RESUME -eq 1 ]]; then
+                        extra_flags+=("--resume")
+                    fi
+                    if [[ $KGFM_NPROC -gt 1 ]]; then
+                        launcher=(torchrun
+                                  --standalone
+                                  --nproc-per-node="$KGFM_NPROC"
+                                  --master-port="$KGFM_MASTER_PORT")
+                    fi
+                    cell_trained_yet=1
+                fi
+                run_step "$step_name" "${launcher[@]}" "$HERE/run_kgfm.py" \
                     --encoder "$encoder" \
                     --max-steps "$MAX_STEPS" \
                     --batch-size "$cell_batch_size" \
@@ -310,7 +452,6 @@ if [[ $SKIP_KGFM -eq 0 ]]; then
                 if [[ -f "$OUT_DIR/$out_name" ]]; then
                     KGFM_FILES+=("$out_name")
                 fi
-                first=0
             done
         done
     done
@@ -319,7 +460,9 @@ else
 fi
 
 # --------------------------- 5) ULTRA ------------------------------------
-if [[ $SKIP_ULTRA -eq 0 ]]; then
+if [[ $RESUME -eq 1 && -f "$OUT_DIR/ultra.json" ]]; then
+    log "skip run_ultra (resume: ultra.json exists)"
+elif [[ $SKIP_ULTRA -eq 0 ]]; then
     run_step run_ultra python "$HERE/run_ultra.py" \
         --gpus "$ULTRA_GPUS" \
         --ckpt "$ULTRA_CKPT" \
@@ -329,7 +472,9 @@ else
 fi
 
 # --------------------------- 6) MOTIF ------------------------------------
-if [[ $SKIP_MOTIF -eq 0 ]]; then
+if [[ $RESUME -eq 1 && -f "$OUT_DIR/motif.json" ]]; then
+    log "skip run_motif (resume: motif.json exists)"
+elif [[ $SKIP_MOTIF -eq 0 ]]; then
     run_step run_motif python "$HERE/run_motif.py" \
         --gpus "$MOTIF_GPUS" \
         --ckpt "$MOTIF_CKPT" \

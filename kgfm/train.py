@@ -11,14 +11,17 @@ Encoders are pluggable: --encoder ngram (default) or --encoder transformer
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from .data import (
@@ -60,10 +63,23 @@ class TrainConfig:
     # Loader
     max_text_len: int = 512
     batch_size: int = 256
+    # When set, overrides `batch_size` and is treated as the per-GPU
+    # micro-batch size. Effective global batch size under DDP is
+    # per_device_train_batch_size * world_size * gradient_accumulation_steps.
+    per_device_train_batch_size: Optional[int] = None
+    # When set, used as the per-GPU batch size for in-loop and final
+    # evaluation. None falls back to max(64, per_device_train_batch_size // 2)
+    # to preserve the existing single-GPU behaviour.
+    per_device_eval_batch_size: Optional[int] = None
+    gradient_accumulation_steps: int = 1
     num_workers: int = 4
     shuffle_buffer: int = 16384
     row_keep_prob: float = 1.0
     max_rows_per_file: Optional[int] = None
+    # Distributed
+    # Backend for torch.distributed when launched via torchrun. "nccl" is
+    # used on CUDA, "gloo" otherwise. Only consulted when WORLD_SIZE>1.
+    dist_backend: str = "nccl"
     # Optim
     max_steps: int = 5000
     log_every: int = 50
@@ -84,6 +100,16 @@ class TrainConfig:
     use_bf16: bool = True
     max_files: Optional[int] = None
     cuda_visible: Optional[str] = None
+    # Resume
+    # When True, train() looks in ckpt_dir for an existing checkpoint
+    # (final.pt > last.pt > best.pt, in that order — "latest in time")
+    # and continues training from its step counter up to max_steps.
+    # Already-finished runs (step >= max_steps) skip the loop entirely
+    # and fall through to the final-test eval pass.
+    resume: bool = False
+    # Explicit checkpoint path to resume from. Overrides the auto-detect
+    # in ckpt_dir when set. Useful for branching off a specific ckpt.
+    resume_from_ckpt: Optional[str] = None
 
 
 def make_loader(files, cfg: TrainConfig, *, train: bool) -> DataLoader:
@@ -107,16 +133,23 @@ def make_loader(files, cfg: TrainConfig, *, train: bool) -> DataLoader:
 
 
 def in_batch_negative_loss(
-    scorer: DistMultScorer,
+    scorer: nn.Module,
     batch: dict,
     device: torch.device,
     *,
     margin: float = 0.0,
     label_smoothing: float = 0.0,
 ) -> torch.Tensor:
-    """In-batch tail-corruption: score each (h_i, r_i) against all t_j."""
+    """In-batch tail-corruption: score each (h_i, r_i) against all t_j.
+
+    Accepts either a raw DistMultScorer or a DDP-wrapped one — we always
+    encode through the underlying module. DDP's gradient all-reduce is
+    registered on the parameters themselves, so backward still syncs
+    correctly even though we bypass DDP.forward.
+    """
+    inner: DistMultScorer = scorer.module if hasattr(scorer, "module") else scorer
     h_text, r_text, t_text = batch["h_text"], batch["r_text"], batch["t_text"]
-    h, r, t = scorer.encode_triple(h_text, r_text, t_text)
+    h, r, t = inner.encode_triple(h_text, r_text, t_text)
     h, r, t = h.to(device), r.to(device), t.to(device)
 
     hr = h * r  # [B, D]
@@ -179,21 +212,111 @@ def resolve_splits(cfg: TrainConfig) -> tuple[List[str], List[str], List[str]]:
     return train, valid, test
 
 
+@dataclass
+class _DistState:
+    """Holds the current torch.distributed state for the training process."""
+    rank: int = 0
+    world_size: int = 1
+    local_rank: int = 0
+    enabled: bool = False  # True iff torch.distributed has been initialized
+    device: torch.device = torch.device("cpu")
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
+
+
+def _init_distributed(cfg: TrainConfig) -> _DistState:
+    """Initialize torch.distributed if launched under torchrun, else no-op.
+
+    Detection is purely env-var-based: WORLD_SIZE>1 means torchrun set us
+    up. When that's true we init the process group, pin each rank to its
+    LOCAL_RANK GPU, and return the full state. Otherwise we return a
+    single-process state where the device is chosen by pick_free_gpu().
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return _DistState(device=pick_free_gpu())
+
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+
+    backend = cfg.dist_backend
+    if backend == "nccl" and not torch.cuda.is_available():
+        backend = "gloo"
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend)
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
+
+    return _DistState(
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        enabled=True,
+        device=device,
+    )
+
+
+def _resolve_per_device_batch_size(cfg: TrainConfig) -> int:
+    """Per-device micro-batch size. Honors per_device_train_batch_size when set."""
+    if cfg.per_device_train_batch_size is not None:
+        return int(cfg.per_device_train_batch_size)
+    return int(cfg.batch_size)
+
+
+def _resolve_eval_batch_size(cfg: TrainConfig, per_device_train_bs: int) -> int:
+    """Per-device eval batch size. Honors per_device_eval_batch_size when set."""
+    if cfg.per_device_eval_batch_size is not None:
+        return int(cfg.per_device_eval_batch_size)
+    # Original heuristic: half of the train batch, but at least 64.
+    return max(64, per_device_train_bs // 2)
+
+
 def train(cfg: TrainConfig) -> None:
-    if cfg.cuda_visible is not None:
+    if cfg.cuda_visible is not None and "WORLD_SIZE" not in os.environ:
+        # Under torchrun, CUDA_VISIBLE_DEVICES (if set) is honored by the
+        # launcher; overriding it here would break the LOCAL_RANK->GPU
+        # mapping. Only apply this knob in single-process mode.
         os.environ["CUDA_VISIBLE_DEVICES"] = cfg.cuda_visible
 
     torch.manual_seed(cfg.seed)
-    device = pick_free_gpu()
-    print(f"[init] device={device}")
+    ds = _init_distributed(cfg)
+    device = ds.device
+
+    def mprint(*args, **kwargs) -> None:
+        """Print only from the main rank."""
+        if ds.is_main:
+            print(*args, **kwargs)
+
+    per_device_bs = _resolve_per_device_batch_size(cfg)
+    eval_bs = _resolve_eval_batch_size(cfg, per_device_bs)
+    accum_steps = max(1, int(cfg.gradient_accumulation_steps))
+    global_bs = per_device_bs * ds.world_size * accum_steps
+
+    mprint(
+        f"[init] device={device} world_size={ds.world_size} rank={ds.rank}"
+        f" per_device_bs={per_device_bs} eval_bs={eval_bs} accum={accum_steps}"
+        f" global_bs={global_bs}"
+    )
 
     train_files, valid_files, test_files = resolve_splits(cfg)
-    print(
+    if ds.world_size > 1:
+        # Shard train files across ranks. Slicing by rank::world_size keeps
+        # the count balanced and the global ordering deterministic. Eval
+        # files stay full because eval runs on rank 0 only.
+        train_files = train_files[ds.rank :: ds.world_size]
+    mprint(
         f"[init] files: train={len(train_files)} "
         f"valid={len(valid_files)} test={len(test_files)}"
     )
     if not train_files:
-        raise SystemExit("No training files found.")
+        raise SystemExit("No training files found for this rank.")
 
     encoder = make_encoder(
         cfg.encoder,
@@ -207,14 +330,38 @@ def train(cfg: TrainConfig) -> None:
         transformer_pooling=cfg.transformer_pooling,
         freeze_encoder=cfg.freeze_encoder,
     )
-    scorer = DistMultScorer(encoder, proj_dim=cfg.proj_dim, normalize=True).to(device)
+    scorer_raw = DistMultScorer(encoder, proj_dim=cfg.proj_dim, normalize=True).to(device)
 
-    n_total = sum(p.numel() for p in scorer.parameters())
-    n_trainable = sum(p.numel() for p in scorer.parameters() if p.requires_grad)
-    print(
-        f"[init] encoder={cfg.encoder} dim={scorer.dim} "
+    # ---- Resume: load model state BEFORE DDP wrap so DDP's initial
+    # broadcast picks up the resumed weights as the rank-0 reference. ----
+    resume_ckpt_path = _find_resume_ckpt(cfg)
+    resumed_payload: Optional[dict] = None
+    if resume_ckpt_path is not None:
+        mprint(f"[resume] loading checkpoint: {resume_ckpt_path}")
+        resumed_payload = torch.load(resume_ckpt_path, map_location=device)
+        try:
+            scorer_raw.load_state_dict(resumed_payload["model_state"])
+        except RuntimeError as e:
+            # Cross-config resumes (e.g. proj_dim changed) won't match
+            # exactly; fall back to a non-strict load and warn.
+            mprint(f"[resume] strict load failed ({e}); retrying non-strict")
+            scorer_raw.load_state_dict(resumed_payload["model_state"], strict=False)
+
+    n_total = sum(p.numel() for p in scorer_raw.parameters())
+    n_trainable = sum(p.numel() for p in scorer_raw.parameters() if p.requires_grad)
+    mprint(
+        f"[init] encoder={cfg.encoder} dim={scorer_raw.dim} "
         f"params total={n_total:,} trainable={n_trainable:,}"
     )
+
+    # Wrap with DDP only when there are trainable params to sync — DDP
+    # complains if it has nothing to bucket. The frozen-encoder + no-proj
+    # configuration produces a zero-trainable-param model.
+    if ds.enabled and n_trainable > 0:
+        device_ids = [ds.local_rank] if device.type == "cuda" else None
+        scorer = DDP(scorer_raw, device_ids=device_ids)
+    else:
+        scorer = scorer_raw
 
     optim = torch.optim.AdamW(
         [p for p in scorer.parameters() if p.requires_grad],
@@ -225,105 +372,211 @@ def train(cfg: TrainConfig) -> None:
     autocast_dtype = torch.bfloat16 if (cfg.use_bf16 and device.type == "cuda") else None
     use_amp = autocast_dtype is not None
 
-    os.makedirs(cfg.ckpt_dir, exist_ok=True)
-    loader = make_loader(train_files, cfg, train=True)
+    if ds.is_main:
+        os.makedirs(cfg.ckpt_dir, exist_ok=True)
+    # Construct the DataLoader with the per-device micro-batch size.
+    loader_cfg = TrainConfig(**{**cfg.__dict__, "batch_size": per_device_bs})
+    loader = make_loader(train_files, loader_cfg, train=True)
 
-    step = 0
+    step = 0          # optimizer steps
+    micro_done = 0    # micro-batches accumulated in the current optimizer step
     t0 = time.time()
     running = 0.0
     best_mrr = -1.0
 
+    # ---- Resume: restore optimizer state + step counter + best_mrr. ----
+    if resumed_payload is not None:
+        if "optim_state" in resumed_payload:
+            try:
+                optim.load_state_dict(resumed_payload["optim_state"])
+                mprint("[resume] loaded optimizer state")
+            except (ValueError, RuntimeError) as e:
+                mprint(
+                    f"[resume] could not load optimizer state ({e}); "
+                    "continuing with a fresh optimizer"
+                )
+        step = int(resumed_payload.get("step", 0))
+        best_mrr = float(resumed_payload.get("best_mrr", -1.0))
+        mprint(
+            f"[resume] continuing from step={step}/{cfg.max_steps} "
+            f"best_mrr={best_mrr:.4f}"
+        )
+        # Free the loaded payload — model + optimizer now hold the tensors.
+        del resumed_payload
+        if step >= cfg.max_steps:
+            mprint(
+                f"[resume] step {step} >= max_steps {cfg.max_steps}; "
+                "skipping training loop and going straight to final eval"
+            )
+
     eval_target_files = valid_files if valid_files else test_files
     eval_label = "valid" if valid_files else "test"
 
+    def autocast_ctx():
+        if use_amp:
+            return torch.autocast(device_type="cuda", dtype=autocast_dtype)
+        return contextlib.nullcontext()
+
+    def sync_ctx(is_last_micro: bool):
+        """DDP no_sync() while accumulating, then sync on the last micro."""
+        if ds.enabled and not is_last_micro and hasattr(scorer, "no_sync"):
+            return scorer.no_sync()
+        return contextlib.nullcontext()
+
+    def barrier() -> None:
+        if ds.enabled:
+            dist.barrier()
+
+    optim.zero_grad(set_to_none=True)
+
     while step < cfg.max_steps:
         for batch in loader:
-            step += 1
             scorer.train()
-            optim.zero_grad(set_to_none=True)
-            if use_amp:
-                with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+            is_last_micro = (micro_done + 1) == accum_steps
+            with sync_ctx(is_last_micro):
+                with autocast_ctx():
                     loss = in_batch_negative_loss(
                         scorer, batch, device,
                         margin=cfg.margin,
                         label_smoothing=cfg.label_smoothing,
                     )
-            else:
-                loss = in_batch_negative_loss(
-                    scorer, batch, device,
-                    margin=cfg.margin,
-                    label_smoothing=cfg.label_smoothing,
-                )
-            loss.backward()
+                # Scale so the accumulated gradient corresponds to the mean
+                # loss over the effective (global) batch.
+                (loss / accum_steps).backward()
+            running += loss.item()
+            micro_done += 1
+
+            if not is_last_micro:
+                continue
+
+            # End of an optimizer step.
             if cfg.grad_clip:
                 torch.nn.utils.clip_grad_norm_(scorer.parameters(), cfg.grad_clip)
             optim.step()
-            running += loss.item()
+            optim.zero_grad(set_to_none=True)
+            step += 1
+            micro_done = 0
 
             if step % cfg.log_every == 0:
                 dt = time.time() - t0
-                avg = running / cfg.log_every
+                # `running` summed log_every * accum_steps micro-batch losses.
+                avg = running / (cfg.log_every * accum_steps)
                 running = 0.0
-                print(
+                # Throughput counts global examples seen since last log.
+                ex = cfg.log_every * global_bs
+                mprint(
                     f"[step {step:>6d}] loss={avg:.4f}  "
-                    f"rate={cfg.log_every*cfg.batch_size/dt:.0f} ex/s",
+                    f"rate={ex/dt:.0f} ex/s",
                     flush=True,
                 )
                 t0 = time.time()
 
             if step % cfg.eval_every == 0 and eval_target_files:
-                metrics = evaluate(
-                    scorer,
-                    eval_target_files,
-                    device,
-                    n_eval_triples=cfg.eval_n_triples,
-                    pool_size=cfg.eval_pool_size,
-                    batch_size=max(64, cfg.batch_size // 2),
-                    num_workers=max(1, cfg.num_workers // 2),
-                    seed=cfg.seed,
-                )
-                print(f"[{eval_label} eval @ step {step}] {metrics}", flush=True)
-                if metrics.get("MRR", 0.0) > best_mrr:
-                    best_mrr = metrics["MRR"]
-                    save_checkpoint(scorer, cfg, step, tag="best")
+                barrier()
+                if ds.is_main:
+                    metrics = evaluate(
+                        scorer_raw,
+                        eval_target_files,
+                        device,
+                        n_eval_triples=cfg.eval_n_triples,
+                        pool_size=cfg.eval_pool_size,
+                        batch_size=eval_bs,
+                        num_workers=max(1, cfg.num_workers // 2),
+                        seed=cfg.seed,
+                    )
+                    print(f"[{eval_label} eval @ step {step}] {metrics}", flush=True)
+                    if metrics.get("MRR", 0.0) > best_mrr:
+                        best_mrr = metrics["MRR"]
+                        save_checkpoint(scorer_raw, cfg, step, tag="best",
+                                        ds=ds, optim=optim, best_mrr=best_mrr)
+                barrier()
                 t0 = time.time()
 
             if step % cfg.ckpt_every == 0:
-                save_checkpoint(scorer, cfg, step, tag="last")
+                save_checkpoint(scorer_raw, cfg, step, tag="last",
+                                ds=ds, optim=optim, best_mrr=best_mrr)
 
             if step >= cfg.max_steps:
                 break
 
-    save_checkpoint(scorer, cfg, step, tag="final")
+    save_checkpoint(scorer_raw, cfg, step, tag="final",
+                    ds=ds, optim=optim, best_mrr=best_mrr)
 
     if test_files:
         # Reload best checkpoint for the final test report (if we had a valid set).
-        if valid_files:
-            best_path = os.path.join(cfg.ckpt_dir, "best.pt")
-            if os.path.exists(best_path):
-                ckpt = torch.load(best_path, map_location=device)
-                scorer.load_state_dict(ckpt["model_state"])
-                print(f"[test] loaded {best_path} (step={ckpt.get('step')})")
-        final = evaluate(
-            scorer,
-            test_files,
-            device,
-            n_eval_triples=cfg.final_n_triples,
-            pool_size=cfg.final_pool_size,
-            batch_size=max(64, cfg.batch_size // 2),
-            num_workers=max(1, cfg.num_workers // 2),
-            seed=cfg.seed,
-        )
-        print(f"[final test] {final}", flush=True)
+        barrier()
+        if ds.is_main:
+            if valid_files:
+                best_path = os.path.join(cfg.ckpt_dir, "best.pt")
+                if os.path.exists(best_path):
+                    ckpt = torch.load(best_path, map_location=device)
+                    scorer_raw.load_state_dict(ckpt["model_state"])
+                    print(f"[test] loaded {best_path} (step={ckpt.get('step')})")
+            final = evaluate(
+                scorer_raw,
+                test_files,
+                device,
+                n_eval_triples=cfg.final_n_triples,
+                pool_size=cfg.final_pool_size,
+                batch_size=eval_bs,
+                num_workers=max(1, cfg.num_workers // 2),
+                seed=cfg.seed,
+            )
+            print(f"[final test] {final}", flush=True)
+        barrier()
+
+    if ds.enabled:
+        dist.destroy_process_group()
 
 
-def save_checkpoint(scorer: nn.Module, cfg: TrainConfig, step: int, tag: str) -> None:
+def save_checkpoint(
+    scorer: nn.Module,
+    cfg: TrainConfig,
+    step: int,
+    tag: str,
+    ds: Optional["_DistState"] = None,
+    optim: Optional[torch.optim.Optimizer] = None,
+    best_mrr: Optional[float] = None,
+) -> None:
+    """Save a checkpoint. In distributed mode, only rank 0 writes.
+
+    Saves the optimizer state and best validation MRR so a later run with
+    ``resume=True`` can pick up exactly where this one left off (same
+    optimizer momentum, same "best" target). Both are optional so the
+    save still works during inference-only paths.
+    """
+    if ds is not None and not ds.is_main:
+        return
+    # If a DDP-wrapped module slipped through, unwrap so the state-dict
+    # keys don't carry the "module." prefix.
+    state = scorer.module.state_dict() if hasattr(scorer, "module") else scorer.state_dict()
     path = os.path.join(cfg.ckpt_dir, f"{tag}.pt")
-    torch.save(
-        {"step": step, "model_state": scorer.state_dict(), "config": cfg.__dict__},
-        path,
-    )
+    payload: dict = {"step": step, "model_state": state, "config": cfg.__dict__}
+    if optim is not None:
+        payload["optim_state"] = optim.state_dict()
+    if best_mrr is not None:
+        payload["best_mrr"] = float(best_mrr)
+    torch.save(payload, path)
     print(f"[ckpt] saved {path} (step={step})")
+
+
+def _find_resume_ckpt(cfg: TrainConfig) -> Optional[str]:
+    """Locate the checkpoint to resume from, if any.
+
+    Explicit ``resume_from_ckpt`` wins; otherwise we pick the most
+    recent-in-time snapshot from ``ckpt_dir``: ``final.pt`` (training
+    completed) > ``last.pt`` (most recent --ckpt-every snapshot) >
+    ``best.pt`` (highest validation MRR, possibly older).
+    """
+    if cfg.resume_from_ckpt:
+        return cfg.resume_from_ckpt if os.path.exists(cfg.resume_from_ckpt) else None
+    if not cfg.resume:
+        return None
+    for tag in ("final.pt", "last.pt", "best.pt"):
+        candidate = os.path.join(cfg.ckpt_dir, tag)
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 def parse_args() -> TrainConfig:
@@ -360,7 +613,27 @@ def parse_args() -> TrainConfig:
                         "to proj_dim before scoring (recommended with frozen BERT).")
     # Loader
     p.add_argument("--max-text-len", type=int, default=512)
-    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--batch-size", type=int, default=256,
+                   help="Per-device micro-batch size. Kept for backwards "
+                        "compatibility; --per-device-train-batch-size "
+                        "overrides this when set.")
+    p.add_argument("--per-device-train-batch-size", type=int, default=None,
+                   help="HF-style per-GPU micro-batch size. Effective "
+                        "global batch size = "
+                        "per_device_train_batch_size * world_size * "
+                        "gradient_accumulation_steps.")
+    p.add_argument("--per-device-eval-batch-size", type=int, default=None,
+                   help="HF-style per-GPU eval batch size, used for in-loop "
+                        "validation and the final test pass. Defaults to "
+                        "max(64, per_device_train_batch_size // 2).")
+    p.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                   help="Number of forward/backward passes per optimizer "
+                        "step. Combined with DDP and "
+                        "--per-device-train-batch-size to control the "
+                        "effective global batch size.")
+    p.add_argument("--dist-backend", default="nccl",
+                   help="torch.distributed backend used under torchrun "
+                        "(falls back to gloo on CPU).")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--shuffle-buffer", type=int, default=16384)
     p.add_argument("--row-keep-prob", type=float, default=1.0)
@@ -385,6 +658,15 @@ def parse_args() -> TrainConfig:
     p.add_argument("--no-bf16", action="store_true")
     p.add_argument("--max-files", type=int, default=None)
     p.add_argument("--cuda-visible", default=None)
+    p.add_argument("--resume", action="store_true",
+                   help="Auto-detect a checkpoint in --ckpt-dir "
+                        "(final.pt > last.pt > best.pt) and continue "
+                        "training from its saved step up to --max-steps. "
+                        "If the saved step already reached --max-steps, "
+                        "the training loop is skipped entirely.")
+    p.add_argument("--resume-from-ckpt", default=None,
+                   help="Explicit checkpoint path to resume from. "
+                        "Overrides the auto-detect inside --ckpt-dir.")
 
     a = p.parse_args()
     return TrainConfig(
@@ -409,6 +691,10 @@ def parse_args() -> TrainConfig:
         proj_dim=a.proj_dim,
         max_text_len=a.max_text_len,
         batch_size=a.batch_size,
+        per_device_train_batch_size=a.per_device_train_batch_size,
+        per_device_eval_batch_size=a.per_device_eval_batch_size,
+        gradient_accumulation_steps=a.gradient_accumulation_steps,
+        dist_backend=a.dist_backend,
         num_workers=a.num_workers,
         shuffle_buffer=a.shuffle_buffer,
         row_keep_prob=a.row_keep_prob,
@@ -431,6 +717,8 @@ def parse_args() -> TrainConfig:
         use_bf16=not a.no_bf16,
         max_files=a.max_files,
         cuda_visible=a.cuda_visible,
+        resume=a.resume,
+        resume_from_ckpt=a.resume_from_ckpt,
     )
 
 

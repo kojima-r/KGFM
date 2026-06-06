@@ -33,7 +33,10 @@ dependencies = [
 
 [project.optional-dependencies]
 transformer = [
-    "transformers>=4.30",
+    # transformers 5.x requires torch>=2.7 (uses torch.float8_e8m0fnu).
+    # The benchmark env is pinned to torch==2.5.1 (for ULTRA's rspmm
+    # CUDA extension), so we cap transformers at the last 4.x release.
+    "transformers>=4.30,<5.0",
 ]
 dev = [
     "pytest",
