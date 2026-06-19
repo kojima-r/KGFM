@@ -36,6 +36,9 @@ set -eo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Postfix appended to the run directory name (results/chembl/<TS>_<RUN_LABEL>).
+export RUN_LABEL="chembl_large"
+
 exec bash "$HERE/bootstrap_chembl.sh" \
     --max-train               500000 \
     --max-valid                10000 \

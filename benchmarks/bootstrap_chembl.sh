@@ -213,14 +213,24 @@ if [[ $RESUME -eq 1 ]]; then
         echo "Resume target not found: $OUT_DIR" >&2
         exit 1
     fi
-    # Follow symlinks so $TS reflects the underlying directory name.
+    # Follow symlinks so $RUN_NAME reflects the underlying directory name.
     OUT_DIR=$(cd "$OUT_DIR" && pwd -P)
-    TS=$(basename "$OUT_DIR")
+    RUN_NAME=$(basename "$OUT_DIR")
+    # Recover the bare UTC timestamp by dropping any "_<label>" postfix
+    # (the timestamp itself contains no underscore).
+    TS="${RUN_NAME%%_*}"
 else
     TS=$(date -u +%Y%m%dT%H%M%SZ)
-    OUT_DIR="$HERE/results/chembl/$TS"
+    # Append a postfix so runs launched via the bootstrap_chembl_*.sh wrappers
+    # are self-identifying, e.g. results/chembl/20260606T090031Z_chembl_xlarge.
+    # Each wrapper exports a fixed RUN_LABEL before exec'ing us; a direct
+    # invocation leaves it empty and gets no postfix.
+    # Keep only directory-name-safe characters in the postfix.
+    RUN_LABEL=$(printf '%s' "${RUN_LABEL:-}" | tr -c '[:alnum:]._-' '_')
+    RUN_NAME="$TS${RUN_LABEL:+_$RUN_LABEL}"
+    OUT_DIR="$HERE/results/chembl/$RUN_NAME"
     mkdir -p "$OUT_DIR"
-    ln -sfn "$TS" "$HERE/results/chembl/latest"
+    ln -sfn "$RUN_NAME" "$HERE/results/chembl/latest"
 fi
 
 LOG="$OUT_DIR/run.log"
@@ -502,7 +512,7 @@ fi
 
 log ""
 log "==> done. Results in $OUT_DIR"
-log "    Latest pointer: $HERE/results/chembl/latest -> $TS"
+log "    Latest pointer: $HERE/results/chembl/latest -> $RUN_NAME"
 echo
 if [[ -f "$OUT_DIR/table.md" ]]; then
     echo "Comparison table:"
