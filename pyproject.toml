@@ -29,6 +29,8 @@ classifiers = [
 dependencies = [
     "torch>=2.0",
     "numpy",
+    # Reads the benchmark settings files in benchmarks/*.yaml.
+    "pyyaml",
 ]
 
 [project.optional-dependencies]
@@ -38,14 +40,25 @@ transformer = [
     # CUDA extension), so we cap transformers at the last 4.x release.
     "transformers>=4.30,<5.0",
 ]
+# Richer `kgfm report` charts. Without these the report still renders, using
+# a built-in SVG fallback.
+report = [
+    "matplotlib",
+    "plotly",
+    # `kgfm viz` falls back to PCA (torch SVD) when this is absent.
+    "umap-learn",
+]
 dev = [
     "pytest",
     "ruff",
 ]
 
 [project.scripts]
-kgfm-train = "kgfm.train:main"
-kgfm-eval = "kgfm.eval:main"
+kgfm = "kgfm.cli:main"
+# ULTRA / MOTIF are other people's methods, not kgfm subcommands. They only
+# share the run directory that `kgfm report` reads.
+kgfm-ultra = "kgfm.baselines.ultra:main"
+kgfm-motif = "kgfm.baselines.motif:main"
 
 [project.urls]
 Homepage = "https://github.com/ryosuke-kojima/kgfm"

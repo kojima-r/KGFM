@@ -81,6 +81,7 @@ class HashedNgramEncoder(nn.Module):
         n_max: int = 5,
         max_ngrams: int = 96,
         sparse: bool = False,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -88,17 +89,21 @@ class HashedNgramEncoder(nn.Module):
         self.n_min = n_min
         self.n_max = n_max
         self.max_ngrams = max_ngrams
+        self.dropout = float(dropout)
         self.bag = nn.EmbeddingBag(
             vocab_size, embedding_dim, mode="mean", sparse=sparse
         )
         nn.init.normal_(self.bag.weight, mean=0.0, std=0.1 / (embedding_dim ** 0.5))
+        self.drop: nn.Module = (
+            nn.Dropout(self.dropout) if self.dropout > 0 else nn.Identity()
+        )
 
     def forward(self, texts: Sequence[str]) -> torch.Tensor:
         flat, offsets = encode_batch_ngram(
             texts, self.vocab_size, self.n_min, self.n_max, self.max_ngrams
         )
         device = self.bag.weight.device
-        return self.bag(flat.to(device), offsets.to(device))
+        return self.drop(self.bag(flat.to(device), offsets.to(device)))
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +127,7 @@ class TransformerEncoder(nn.Module):
         max_length: int = 128,
         pooling: str = "mean",
         freeze: bool = False,
+        dropout: Optional[float] = None,
     ):
         super().__init__()
         try:
@@ -135,13 +141,33 @@ class TransformerEncoder(nn.Module):
         self.max_length = max_length
         self.pooling = pooling
         self.freeze = freeze
+        self.dropout = dropout
 
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         except (ValueError, OSError):
             # Some older checkpoints ship only a slow tokenizer.
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
-        self.model = AutoModel.from_pretrained(model_name)
+        # Dropout has to be set at construction: it lives in the HF config and
+        # the layers read it when they are built. None keeps the pretrained
+        # model's own value (0.1 for BERT), which is why this is Optional
+        # rather than defaulting to 0.
+        if dropout is None:
+            self.model = AutoModel.from_pretrained(model_name)
+        else:
+            from transformers import AutoConfig
+
+            # Every architecture spells these differently (BERT/RoBERTa use
+            # hidden_dropout_prob, DistilBERT uses dropout, ...), so set
+            # whichever the loaded config actually has rather than passing
+            # BERT's names as kwargs and crashing on anything else.
+            hf_cfg = AutoConfig.from_pretrained(model_name)
+            known = ("hidden_dropout_prob", "attention_probs_dropout_prob",
+                     "dropout", "attention_dropout")
+            for attr in known:
+                if hasattr(hf_cfg, attr):
+                    setattr(hf_cfg, attr, dropout)
+            self.model = AutoModel.from_pretrained(model_name, config=hf_cfg)
         self.embedding_dim: int = int(self.model.config.hidden_size)
 
         if freeze:
@@ -210,6 +236,9 @@ def make_encoder(
     transformer_max_length: int = 128,
     transformer_pooling: str = "mean",
     freeze_encoder: bool = False,
+    # Regularization inside the encoder. None = keep the pretrained model's own
+    # value; the head's dropout is a separate knob on DistMultScorer.
+    encoder_dropout: Optional[float] = None,
 ) -> nn.Module:
     name = name.lower()
     if name in ("ngram", "hash", "hashed-ngram", "hashngram"):
@@ -219,6 +248,7 @@ def make_encoder(
             n_min=n_min,
             n_max=n_max,
             max_ngrams=max_ngrams,
+            dropout=encoder_dropout or 0.0,
         )
     if name in ("transformer", "bert", "hf"):
         return TransformerEncoder(
@@ -226,5 +256,6 @@ def make_encoder(
             max_length=transformer_max_length,
             pooling=transformer_pooling,
             freeze=freeze_encoder,
+            dropout=encoder_dropout,
         )
     raise ValueError(f"Unknown encoder: {name!r} (use 'ngram' or 'transformer')")

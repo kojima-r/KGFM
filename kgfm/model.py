@@ -31,10 +31,19 @@ class DistMultScorer(nn.Module):
         encoder: nn.Module,
         proj_dim: Optional[int] = None,
         normalize: bool = True,
+        head_dropout: float = 0.0,
     ):
         super().__init__()
         self.encoder = encoder
         self.normalize = normalize
+        # Regularizes the *coupling* between encoder and score, deliberately a
+        # separate knob from the encoder's own dropout: with a frozen encoder
+        # this head is the only thing that trains, and with a fine-tuned one
+        # the two halves overfit at different rates.
+        self.head_dropout = float(head_dropout)
+        self.drop: nn.Module = (
+            nn.Dropout(self.head_dropout) if self.head_dropout > 0 else nn.Identity()
+        )
         in_dim = int(getattr(encoder, "embedding_dim"))
         if proj_dim is None or proj_dim == in_dim:
             self.proj: nn.Module = nn.Identity()
@@ -43,6 +52,15 @@ class DistMultScorer(nn.Module):
             self.proj = nn.Linear(in_dim, proj_dim)
             self.dim = proj_dim
 
+    def head_parameters(self):
+        """Everything that is not the encoder — the projection head.
+
+        Kept next to the module that owns it so the optimizer's parameter
+        groups stay correct if the head ever grows past a single Linear.
+        """
+        encoder_ids = {id(p) for p in self.encoder.parameters()}
+        return [p for p in self.parameters() if id(p) not in encoder_ids]
+
     @staticmethod
     def _maybe_norm(x: torch.Tensor, do: bool) -> torch.Tensor:
         if not do:
@@ -50,7 +68,9 @@ class DistMultScorer(nn.Module):
         return x / (x.norm(dim=-1, keepdim=True).clamp_min(1e-6))
 
     def encode(self, texts: Sequence[str]) -> torch.Tensor:
-        return self.proj(self.encoder(texts))
+        # Dropout sits between the two regularized halves: on the encoder's
+        # output, before the head consumes it.
+        return self.proj(self.drop(self.encoder(texts)))
 
     def encode_triple(
         self, h_text: Sequence[str], r_text: Sequence[str], t_text: Sequence[str]

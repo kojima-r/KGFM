@@ -1,0 +1,50 @@
+# Extra-large scale — the most thorough run that still finishes overnight.
+# Estimated wall clock: ~21.2 h of a 24 h budget (ULTRA 15.1 h + MOTIF 0.9 h +
+# kgfm 5.1 h). Use resume_chembl.sh if it is interrupted.
+#
+# Same publication-grade choices as config_large.yaml, with more training
+# (60k steps = 15.4M examples seen) and a larger, harder KG.
+#
+# Sized for a single H200 (143 GB). Runtime estimates come from measured
+# throughput on this machine, not guesses:
+#   ngram train    ~20,000 examples/s      transformer train ~1,500 examples/s
+#   ULTRA (CPU)     1134 s  @ n_test=2,000, n_train=50,000
+#   MOTIF (GPU)       70 s  @ the same point
+# ULTRA and MOTIF cost scale as n_test x n_train (message passing over every
+# edge, per query). ULTRA runs on CPU because its rspmm kernel crashes on
+# sm_90, which makes it the dominant term in every config below — skipping it
+# (run only `kgfm bench run` + `kgfm-motif`) roughly halves the wall clock.
+
+run_label: chembl_xlarge
+
+# |E| = 419,252 at this cap (measured by a prep run, not estimated)
+max_train: 400000
+max_valid: 12000
+max_test: 12000
+
+encoders: [ngram, transformer]
+freezes: ["off", "on"]
+protocols: [pooled, filtered]
+
+max_steps: 60000
+# One batch size for every cell on purpose: max_steps then means the same
+# amount of data for ngram and transformer, so their curves are comparable
+# step-for-step. B is also a *modeling* knob here — in_batch_negative_loss
+# scores each (h,r) against every other tail in the batch, so B-1 is the
+# number of negatives.
+#
+# 512 is measured, not guessed. On this H200, per training step:
+#   transformer  B=256  1,127 ex/s  12.3 GiB | B=512  3,014 ex/s  22.2 GiB
+#                B=384  2,610 ex/s  17.2 GiB | B=768  2,919 ex/s  32.2 GiB
+#   ngram        B=256 17,690 ex/s   5.1 GiB | B=4096 21,904 ex/s  5.2 GiB
+# The transformer peaks at 512 (768 is slower and uses 45% more memory), and
+# ngram is within 5% of its plateau there. 22 GiB of 143 GiB leaves plenty of
+# headroom for the eval passes, which encode the whole tail vocabulary.
+batch_size: 512
+proj_dim: 256
+
+n_eval_triples: 12000
+pool_size: 12000
+
+max_filter_tails: 460000
+max_filter_rows: 10000000

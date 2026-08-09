@@ -1,0 +1,25 @@
+# Smoke scale — proves the pipeline end to end in a few minutes.
+# Selected with: kgfm bench run --config benchmarks/config_small.yaml
+#
+# Any setting named in kgfm/bench/config.py:BenchConfig can appear here;
+# unknown keys are rejected rather than ignored. Command-line flags override
+# whatever is set here.
+
+run_label: chembl_small
+
+# Triple caps for the entity-ID KG the baselines consume. Both are well under
+# 0.1% of the corpus — see "全コーパスに対する --max-* のカバー率" in README.
+max_train: 50000
+max_valid: 2000
+max_test: 2000
+
+# kgfm sweep
+encoders: [ngram, transformer]
+freezes: ["off"]          # quote: bare `off` is boolean False in YAML
+protocols: [pooled, filtered]
+max_steps: 200
+batch_size: 256
+
+# filtered-protocol candidate caps
+max_filter_tails: 50000
+max_filter_rows: 1000000

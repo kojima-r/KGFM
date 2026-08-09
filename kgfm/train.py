@@ -33,6 +33,13 @@ from .data import (
 )
 from .encoders import make_encoder
 from .eval import evaluate
+from .losses import (
+    DEFAULT_LOSS,
+    DEFAULT_TEMPERATURE,
+    LOSSES,
+    compute_loss,
+    duplicate_tail_mask,
+)
 from .model import DistMultScorer
 from .utils import pick_free_gpu
 
@@ -86,11 +93,38 @@ class TrainConfig:
     eval_every: int = 1000
     eval_pool_size: int = 2000
     eval_n_triples: int = 2000
+    # Held-out batches averaged for the validation loss reported next to the
+    # in-loop metrics. 0 disables it.
+    valid_loss_batches: int = 10
     final_pool_size: int = 5000
     final_n_triples: int = 5000
-    lr: float = 1e-3
+    # None = pick from the encoder (see `resolved_lr`). An explicit --lr wins.
+    lr: Optional[float] = None
+    # Base weight decay. The encoder and the projection head each get their
+    # own, falling back to this when unset — they overfit at very different
+    # rates (measured on the large ChEMBL run: the fine-tuned transformer's
+    # train loss kept falling 2.25 -> 1.97 while valid loss rose after step
+    # 12.5k, whereas the frozen cell, which only trains the head, did not).
     weight_decay: float = 0.0
-    margin: float = 0.0
+    encoder_weight_decay: Optional[float] = None
+    head_weight_decay: Optional[float] = None
+    # Dropout, likewise split. `encoder_dropout=None` keeps the pretrained
+    # model's own value (0.1 for BERT); head_dropout applies to the encoder
+    # output just before the projection.
+    encoder_dropout: Optional[float] = None
+    head_dropout: float = 0.0
+    # Exclude in-batch "negatives" whose tail string equals the positive's.
+    # They are false negatives and put a floor under the loss; see
+    # losses.duplicate_tail_mask.
+    mask_duplicate_tails: bool = True
+    # Training objective over in-batch negatives; see kgfm/losses.py.
+    loss: str = DEFAULT_LOSS
+    # Softmax sharpness for `contrastive`. Ignored by the other losses.
+    loss_temperature: float = DEFAULT_TEMPERATURE
+    # Used by `margin` and `self_adversarial`, which score raw (unnormalized)
+    # similarities — the right value depends on that scale.
+    margin: float = 1.0
+    adversarial_temperature: float = 1.0
     label_smoothing: float = 0.0
     grad_clip: float = 1.0
     # I/O
@@ -110,6 +144,26 @@ class TrainConfig:
     # Explicit checkpoint path to resume from. Overrides the auto-detect
     # in ckpt_dir when set. Useful for branching off a specific ckpt.
     resume_from_ckpt: Optional[str] = None
+
+
+# A single learning rate cannot serve both encoders. The hashed-ngram
+# EmbeddingBag is trained from scratch and wants a large step; fine-tuning a
+# pretrained LM at the same rate destroys it — observed directly: at 1e-3
+# BERT-base collapsed to a constant embedding (cosine similarity 1.0 between
+# unrelated texts) and the loss moved less than 1e-3 over 200 steps.
+NGRAM_LR = 1e-3
+TRANSFORMER_LR = 3e-5          # standard BERT fine-tuning range is 2e-5..5e-5
+
+
+def default_lr(encoder: str, freeze_encoder: bool = False) -> float:
+    """Learning rate to use when none was given explicitly.
+
+    A frozen encoder trains only the projection head, which is a small
+    from-scratch layer — so it takes the large rate, not the fine-tuning one.
+    """
+    if encoder.lower() in ("transformer", "bert", "hf") and not freeze_encoder:
+        return TRANSFORMER_LR
+    return NGRAM_LR
 
 
 def make_loader(files, cfg: TrainConfig, *, train: bool) -> DataLoader:
@@ -137,10 +191,18 @@ def in_batch_negative_loss(
     batch: dict,
     device: torch.device,
     *,
-    margin: float = 0.0,
+    loss: str = DEFAULT_LOSS,
+    loss_temperature: float = DEFAULT_TEMPERATURE,
+    margin: float = 1.0,
+    adversarial_temperature: float = 1.0,
     label_smoothing: float = 0.0,
+    mask_duplicate_tails: bool = True,
 ) -> torch.Tensor:
-    """In-batch tail-corruption: score each (h_i, r_i) against all t_j.
+    """Encode a batch and score it against itself under the chosen objective.
+
+    In-batch tail corruption: for row i the positive is t_i and the other B-1
+    tails are the negatives, so B sets the negative count. Which objective is
+    applied to that score matrix is `kgfm/losses.py`'s business.
 
     Accepts either a raw DistMultScorer or a DDP-wrapped one — we always
     encode through the underlying module. DDP's gradient all-reduce is
@@ -148,22 +210,114 @@ def in_batch_negative_loss(
     correctly even though we bypass DDP.forward.
     """
     inner: DistMultScorer = scorer.module if hasattr(scorer, "module") else scorer
-    h_text, r_text, t_text = batch["h_text"], batch["r_text"], batch["t_text"]
-    h, r, t = inner.encode_triple(h_text, r_text, t_text)
+    h, r, t = inner.encode_triple(batch["h_text"], batch["r_text"], batch["t_text"])
     h, r, t = h.to(device), r.to(device), t.to(device)
+    fn_mask = (
+        duplicate_tail_mask(batch["t_text"], device)
+        if mask_duplicate_tails else None
+    )
+    return compute_loss(
+        loss, h, r, t,
+        temperature=loss_temperature,
+        margin=margin,
+        adversarial_temperature=adversarial_temperature,
+        label_smoothing=label_smoothing,
+        false_negative_mask=fn_mask,
+    )
 
-    hr = h * r  # [B, D]
-    logits = hr @ t.t()  # [B, B]
-    B = logits.size(0)
-    target = torch.arange(B, device=device)
 
-    if margin > 0.0:
-        pos = logits.diag().unsqueeze(1)
-        neg = logits.masked_fill(
-            torch.eye(B, device=device, dtype=torch.bool), float("-inf")
-        )
-        return F.relu(margin - pos + neg).mean()
-    return F.cross_entropy(logits, target, label_smoothing=label_smoothing)
+def param_groups(scorer: DistMultScorer, cfg: "TrainConfig") -> List[dict]:
+    """AdamW parameter groups splitting the encoder from the projection head.
+
+    The two halves want different regularization: the encoder carries almost
+    all the capacity and is what memorizes train-specific entity strings,
+    while the head is a single Linear that a frozen-encoder run relies on
+    entirely. `encoder_weight_decay` / `head_weight_decay` fall back to the
+    shared `weight_decay` when unset.
+
+    Within each half, biases and 1-D parameters (LayerNorm scales) are put in
+    a no-decay group — decaying them is the standard transformer footgun, and
+    it matters more here now that the encoder can be decayed at all.
+    """
+    enc_wd = (cfg.encoder_weight_decay if cfg.encoder_weight_decay is not None
+              else cfg.weight_decay)
+    head_wd = (cfg.head_weight_decay if cfg.head_weight_decay is not None
+               else cfg.weight_decay)
+    head_ids = {id(p) for p in scorer.head_parameters()}
+
+    buckets: dict = {
+        ("encoder", enc_wd): [], ("encoder_nodecay", 0.0): [],
+        ("head", head_wd): [], ("head_nodecay", 0.0): [],
+    }
+    for p in scorer.parameters():
+        if not p.requires_grad:
+            continue
+        half = "head" if id(p) in head_ids else "encoder"
+        wd = head_wd if half == "head" else enc_wd
+        if p.ndim <= 1:
+            buckets[(f"{half}_nodecay", 0.0)].append(p)
+        else:
+            buckets[(half, wd)].append(p)
+    return [
+        {"name": name, "params": params, "weight_decay": wd}
+        for (name, wd), params in buckets.items() if params
+    ]
+
+
+def loss_kwargs(cfg: "TrainConfig") -> dict:
+    """The loss hyperparameters carried by a config, in one place."""
+    return {
+        "loss": cfg.loss,
+        "loss_temperature": cfg.loss_temperature,
+        "margin": cfg.margin,
+        "adversarial_temperature": cfg.adversarial_temperature,
+        "label_smoothing": cfg.label_smoothing,
+        "mask_duplicate_tails": cfg.mask_duplicate_tails,
+    }
+
+
+@torch.no_grad()
+def evaluate_loss(
+    scorer: nn.Module,
+    files: List[str],
+    cfg: TrainConfig,
+    device: torch.device,
+    *,
+    batch_size: int,
+    n_batches: int,
+    seed: int = 0,
+) -> Optional[float]:
+    """Mean in-batch-negative loss over a few held-out batches.
+
+    Reported alongside the validation metrics so the report can plot train and
+    valid loss on one axis. ``batch_size`` must be the *training* batch size:
+    the loss is a softmax over in-batch negatives, so its scale is set by B.
+    Measuring valid at the (smaller) eval batch size would make it look
+    systematically better than train for no reason at all.
+    """
+    if not files or n_batches <= 0:
+        return None
+    loader_cfg = TrainConfig(**{**cfg.__dict__, "batch_size": batch_size})
+    loader = make_loader(files, loader_cfg, train=False)
+    was_training = scorer.training
+    scorer.eval()
+    total, seen = 0.0, 0
+    try:
+        for batch in loader:
+            # A short tail batch would be scored against fewer negatives, so
+            # skip it rather than average an incomparable number in.
+            if len(batch["h_text"]) < batch_size:
+                continue
+            total += float(
+                in_batch_negative_loss(scorer, batch, device, **loss_kwargs(cfg))
+            )
+            seen += 1
+            if seen >= n_batches:
+                break
+    finally:
+        if was_training:
+            scorer.train()
+    return total / seen if seen else None
 
 
 def resolve_splits(cfg: TrainConfig) -> tuple[List[str], List[str], List[str]]:
@@ -329,8 +483,12 @@ def train(cfg: TrainConfig) -> None:
         transformer_max_length=cfg.transformer_max_length,
         transformer_pooling=cfg.transformer_pooling,
         freeze_encoder=cfg.freeze_encoder,
+        encoder_dropout=cfg.encoder_dropout,
     )
-    scorer_raw = DistMultScorer(encoder, proj_dim=cfg.proj_dim, normalize=True).to(device)
+    scorer_raw = DistMultScorer(
+        encoder, proj_dim=cfg.proj_dim, normalize=True,
+        head_dropout=cfg.head_dropout,
+    ).to(device)
 
     # ---- Resume: load model state BEFORE DDP wrap so DDP's initial
     # broadcast picks up the resumed weights as the rank-0 reference. ----
@@ -363,11 +521,29 @@ def train(cfg: TrainConfig) -> None:
     else:
         scorer = scorer_raw
 
-    optim = torch.optim.AdamW(
-        [p for p in scorer.parameters() if p.requires_grad],
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-    )
+    lr = cfg.lr if cfg.lr is not None else default_lr(cfg.encoder, cfg.freeze_encoder)
+    if cfg.lr is None:
+        mprint(f"[init] lr={lr:g} (default for encoder={cfg.encoder} "
+               f"freeze={cfg.freeze_encoder})")
+    else:
+        mprint(f"[init] lr={lr:g} (explicit)")
+    mprint(f"[init] loss={cfg.loss}"
+           + (f" temperature={cfg.loss_temperature:g}" if cfg.loss == "contrastive"
+              else f" margin={cfg.margin:g}" if cfg.loss in ("margin", "self_adversarial")
+              else ""))
+    # Built from the unwrapped module: DDP hands back the same tensors, and
+    # the split is defined by scorer_raw.encoder vs its head.
+    groups = param_groups(scorer_raw, cfg)
+    optim = torch.optim.AdamW(groups, lr=lr, weight_decay=cfg.weight_decay)
+    if ds.is_main:
+        mprint("[init] " + " ".join(
+            f"{g['name']}={g['weight_decay']:g}(n={len(g['params'])})" for g in groups
+        ) + " weight_decay"
+          # "unset" rather than a number: for a transformer that means the
+          # pretrained config's own value (0.1 for BERT), for ngram it means 0.
+          + f" | dropout encoder={cfg.encoder_dropout if cfg.encoder_dropout is not None else 'unset'}"
+          + f" head={cfg.head_dropout:g}"
+          + f" | mask_duplicate_tails={cfg.mask_duplicate_tails}")
 
     autocast_dtype = torch.bfloat16 if (cfg.use_bf16 and device.type == "cuda") else None
     use_amp = autocast_dtype is not None
@@ -382,6 +558,11 @@ def train(cfg: TrainConfig) -> None:
     micro_done = 0    # micro-batches accumulated in the current optimizer step
     t0 = time.time()
     running = 0.0
+    # clip_grad_norm_ returns the pre-clip total norm — a standard health
+    # signal (exploding / vanishing gradients), free to collect since we
+    # already call it.
+    running_gnorm = 0.0
+    gnorm_count = 0
     best_mrr = -1.0
 
     # ---- Resume: restore optimizer state + step counter + best_mrr. ----
@@ -436,9 +617,7 @@ def train(cfg: TrainConfig) -> None:
             with sync_ctx(is_last_micro):
                 with autocast_ctx():
                     loss = in_batch_negative_loss(
-                        scorer, batch, device,
-                        margin=cfg.margin,
-                        label_smoothing=cfg.label_smoothing,
+                        scorer, batch, device, **loss_kwargs(cfg)
                     )
                 # Scale so the accumulated gradient corresponds to the mean
                 # loss over the effective (global) batch.
@@ -451,7 +630,10 @@ def train(cfg: TrainConfig) -> None:
 
             # End of an optimizer step.
             if cfg.grad_clip:
-                torch.nn.utils.clip_grad_norm_(scorer.parameters(), cfg.grad_clip)
+                running_gnorm += float(
+                    torch.nn.utils.clip_grad_norm_(scorer.parameters(), cfg.grad_clip)
+                )
+                gnorm_count += 1
             optim.step()
             optim.zero_grad(set_to_none=True)
             step += 1
@@ -464,9 +646,13 @@ def train(cfg: TrainConfig) -> None:
                 running = 0.0
                 # Throughput counts global examples seen since last log.
                 ex = cfg.log_every * global_bs
+                gnorm_str = ""
+                if gnorm_count:
+                    gnorm_str = f"  gnorm={running_gnorm / gnorm_count:.4f}"
+                    running_gnorm, gnorm_count = 0.0, 0
                 mprint(
                     f"[step {step:>6d}] loss={avg:.4f}  "
-                    f"rate={ex/dt:.0f} ex/s",
+                    f"rate={ex/dt:.0f} ex/s{gnorm_str}",
                     flush=True,
                 )
                 t0 = time.time()
@@ -484,6 +670,14 @@ def train(cfg: TrainConfig) -> None:
                         num_workers=max(1, cfg.num_workers // 2),
                         seed=cfg.seed,
                     )
+                    vloss = evaluate_loss(
+                        scorer_raw, eval_target_files, cfg, device,
+                        batch_size=per_device_bs,
+                        n_batches=cfg.valid_loss_batches,
+                        seed=cfg.seed,
+                    )
+                    if vloss is not None:
+                        metrics["loss"] = vloss
                     print(f"[{eval_label} eval @ step {step}] {metrics}", flush=True)
                     if metrics.get("MRR", 0.0) > best_mrr:
                         best_mrr = metrics["MRR"]
@@ -579,8 +773,8 @@ def _find_resume_ckpt(cfg: TrainConfig) -> Optional[str]:
     return None
 
 
-def parse_args() -> TrainConfig:
-    p = argparse.ArgumentParser()
+def add_arguments(p: argparse.ArgumentParser) -> None:
+    """Register the training flags on ``p`` (shared by `kgfm train`)."""
     # Data
     p.add_argument("--data-root", default="data")
     p.add_argument("--pattern", default="**/latest/*.tsv")
@@ -644,11 +838,56 @@ def parse_args() -> TrainConfig:
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--eval-pool-size", type=int, default=2000)
     p.add_argument("--eval-n-triples", type=int, default=2000)
+    p.add_argument("--valid-loss-batches", type=int, default=10,
+                   help="Held-out batches averaged into the validation loss "
+                        "logged next to the in-loop metrics (0 disables). "
+                        "Measured at the training batch size so it is "
+                        "comparable with the training loss.")
     p.add_argument("--final-pool-size", type=int, default=5000)
     p.add_argument("--final-n-triples", type=int, default=5000)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--margin", type=float, default=0.0)
+    p.add_argument("--lr", type=float, default=None,
+                   help=f"Learning rate. Default depends on the encoder: "
+                        f"{NGRAM_LR:g} for ngram (and for any frozen encoder, "
+                        f"which trains only the projection head), "
+                        f"{TRANSFORMER_LR:g} for fine-tuning a transformer.")
+    p.add_argument("--weight-decay", type=float, default=0.0,
+                   help="Base weight decay, used for any half not given its "
+                        "own value below.")
+    p.add_argument("--encoder-weight-decay", type=float, default=None,
+                   help="Weight decay for the text encoder only. Defaults to "
+                        "--weight-decay. Biases and LayerNorm scales are "
+                        "always excluded.")
+    p.add_argument("--head-weight-decay", type=float, default=None,
+                   help="Weight decay for the projection head only. Defaults "
+                        "to --weight-decay.")
+    p.add_argument("--encoder-dropout", type=float, default=None,
+                   help="Dropout inside the encoder (hidden + attention for a "
+                        "transformer, on the pooled embedding for ngram). "
+                        "Unset keeps the pretrained model's own value.")
+    p.add_argument("--head-dropout", type=float, default=0.0,
+                   help="Dropout on the encoder output, before the projection "
+                        "head (default: 0).")
+    p.add_argument("--mask-duplicate-tails", dest="mask_duplicate_tails",
+                   action="store_true", default=True,
+                   help="Drop in-batch negatives whose tail string equals the "
+                        "positive's (default: on). They are false negatives "
+                        "and put a floor under the loss.")
+    p.add_argument("--no-mask-duplicate-tails", dest="mask_duplicate_tails",
+                   action="store_false",
+                   help="Keep duplicate tails as negatives (pre-masking "
+                        "behaviour).")
+    p.add_argument("--loss", default=DEFAULT_LOSS, choices=list(LOSSES),
+                   help=f"Training objective over in-batch negatives "
+                        f"(default: {DEFAULT_LOSS}). See kgfm/losses.py.")
+    p.add_argument("--loss-temperature", type=float, default=DEFAULT_TEMPERATURE,
+                   help=f"Softmax sharpness for --loss contrastive "
+                        f"(default: {DEFAULT_TEMPERATURE}). Ignored otherwise.")
+    p.add_argument("--margin", type=float, default=1.0,
+                   help="Margin for --loss margin / self_adversarial. These "
+                        "score raw similarities, so tune it to that scale.")
+    p.add_argument("--adversarial-temperature", type=float, default=1.0,
+                   help="Negative-weighting sharpness for "
+                        "--loss self_adversarial.")
     p.add_argument("--label-smoothing", type=float, default=0.0)
     p.add_argument("--grad-clip", type=float, default=1.0)
     # I/O
@@ -668,7 +907,9 @@ def parse_args() -> TrainConfig:
                    help="Explicit checkpoint path to resume from. "
                         "Overrides the auto-detect inside --ckpt-dir.")
 
-    a = p.parse_args()
+
+def config_from_args(a: argparse.Namespace) -> TrainConfig:
+    """Build a TrainConfig from a namespace produced by `add_arguments`."""
     return TrainConfig(
         data_root=a.data_root,
         pattern=a.pattern,
@@ -704,11 +945,20 @@ def parse_args() -> TrainConfig:
         eval_every=a.eval_every,
         eval_pool_size=a.eval_pool_size,
         eval_n_triples=a.eval_n_triples,
+        valid_loss_batches=a.valid_loss_batches,
         final_pool_size=a.final_pool_size,
         final_n_triples=a.final_n_triples,
         lr=a.lr,
         weight_decay=a.weight_decay,
+        encoder_weight_decay=a.encoder_weight_decay,
+        head_weight_decay=a.head_weight_decay,
+        encoder_dropout=a.encoder_dropout,
+        head_dropout=a.head_dropout,
+        mask_duplicate_tails=a.mask_duplicate_tails,
+        loss=a.loss,
+        loss_temperature=a.loss_temperature,
         margin=a.margin,
+        adversarial_temperature=a.adversarial_temperature,
         label_smoothing=a.label_smoothing,
         grad_clip=a.grad_clip,
         ckpt_dir=a.ckpt_dir,
@@ -722,10 +972,11 @@ def parse_args() -> TrainConfig:
     )
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     """CLI entrypoint: parse args and run training."""
-    cfg = parse_args()
-    train(cfg)
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    add_arguments(p)
+    train(config_from_args(p.parse_args(argv)))
 
 
 if __name__ == "__main__":

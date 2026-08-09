@@ -128,6 +128,48 @@ def build_filter_index(
     return tail_vocab, hr_to_tails
 
 
+# Scores are float32 dot products over a few hundred dimensions, so ~1e-6
+# relative error is accumulated noise, not signal. Anything closer than this
+# counts as a tie. Chosen to sit above float32 dot-product error and far below
+# the score gaps a model that has actually learned anything produces.
+TIE_RTOL = 1e-5
+TIE_ATOL = 1e-8
+
+
+def _ranks_with_ties(
+    all_scores: torch.Tensor,
+    gt: torch.Tensor,
+    *,
+    rtol: float = TIE_RTOL,
+    atol: float = TIE_ATOL,
+) -> torch.Tensor:
+    """Rank of the true tail, averaging over ties (within a tolerance).
+
+    Counting only strictly-greater scores (``(scores > gt).sum() + 1``) awards
+    rank 1 to every tied candidate, so a model whose embeddings have collapsed
+    scores a *perfect* MRR of 1.0. That is not hypothetical — an under-trained
+    transformer cell reported exactly that.
+
+    Exact equality is not enough to catch it. A collapsed model's scores differ
+    by ~1e-7 because the true tail is scored with ``(hr*t).sum(-1)`` while the
+    candidates come from ``hr @ pool.t()``: different float accumulation order,
+    and the difference is *systematic*, so the true tail wins every tie-break
+    and MRR lands around 0.93 instead. Comparing within a tolerance closes that.
+
+    Rank is the mean of the optimistic (``#greater + 1``) and pessimistic
+    (``#greater + #tied``) ranks, i.e. ``#greater + (#tied + 1) / 2``. ``#tied``
+    includes the true score itself, so with no ties it is 1 and the formula
+    reduces exactly to the old ``#greater + 1``.
+    """
+    tied = torch.isclose(all_scores, gt.expand_as(all_scores), rtol=rtol, atol=atol)
+    # Each candidate is greater, tied, or less — never two of them. Without
+    # excluding ties here, a score just above the tolerance edge would be
+    # counted twice and inflate the rank.
+    n_greater = ((all_scores > gt) & ~tied).sum(dim=1).to(torch.float32)
+    n_tied = tied.sum(dim=1).to(torch.float32)
+    return n_greater + (n_tied + 1.0) / 2.0
+
+
 def _accumulate_metrics(
     ranks: torch.Tensor, k_hit: int, totals: Dict[str, float]
 ) -> None:
@@ -192,7 +234,7 @@ def _evaluate_pooled(
                 scores_pool[i, j] = float("-inf")
         all_scores = torch.cat([scores_pool, true_score], dim=1)  # [B, P+1]
         gt = all_scores[:, -1:]  # last column is the true tail
-        ranks = (all_scores > gt).sum(dim=1) + 1
+        ranks = _ranks_with_ties(all_scores, gt)
         _accumulate_metrics(ranks, k_hit, totals)
         n += B
         if n >= n_eval_triples:
@@ -288,7 +330,7 @@ def _evaluate_filtered(
         all_scores = torch.cat([masked, true_score], dim=1)  # [B, V+1]
 
         gt = all_scores[:, -1:]
-        ranks = (all_scores > gt).sum(dim=1) + 1
+        ranks = _ranks_with_ties(all_scores, gt)
         _accumulate_metrics(ranks, k_hit, totals)
         n += B
         if n >= n_eval_triples:
@@ -390,25 +432,19 @@ def _load_scorer_from_checkpoint(
         transformer_max_length=cfg.get("transformer_max_length", 128),
         transformer_pooling=cfg.get("transformer_pooling", "mean"),
         freeze_encoder=cfg.get("freeze_encoder", False),
+        encoder_dropout=cfg.get("encoder_dropout"),
     )
     scorer = DistMultScorer(
-        encoder, proj_dim=cfg.get("proj_dim"), normalize=True
+        encoder, proj_dim=cfg.get("proj_dim"), normalize=True,
+        head_dropout=cfg.get("head_dropout", 0.0),
     ).to(device)
     scorer.load_state_dict(ckpt["model_state"])
     scorer.eval()
     return scorer
 
 
-def main() -> None:
-    """CLI: ``kgfm-eval --ckpt PATH --test-list FILE [--protocol filtered ...]``."""
-    import argparse
-
-    from .data import discover_tsv_files, read_file_list, split_files_three_way
-    from .utils import pick_free_gpu
-
-    p = argparse.ArgumentParser(
-        description="Evaluate a kgfm checkpoint with MRR / Hit@k / nDCG."
-    )
+def add_arguments(p) -> None:
+    """Register the evaluation flags on ``p`` (shared by `kgfm eval`)."""
     p.add_argument("--ckpt", required=True, help="Path to a checkpoint .pt file.")
     p.add_argument("--test-list", default=None,
                    help="Text file with one TSV path per line.")
@@ -444,7 +480,12 @@ def main() -> None:
     p.add_argument("--k-hit", type=int, default=10)
     p.add_argument("--max-text-len", type=int, default=512)
     p.add_argument("--seed", type=int, default=0)
-    args = p.parse_args()
+
+
+def run_from_args(args) -> dict:
+    """Evaluate a checkpoint from a namespace produced by `add_arguments`."""
+    from .data import discover_tsv_files, read_file_list, split_files_three_way
+    from .utils import pick_free_gpu
 
     if args.test_list:
         test_files = read_file_list(args.test_list)
@@ -485,6 +526,18 @@ def main() -> None:
         seed=args.seed,
     )
     print(f"[eval] {metrics}")
+    return metrics
+
+
+def main(argv=None) -> None:
+    """CLI: ``kgfm eval --ckpt PATH --test-list FILE [--protocol filtered ...]``."""
+    import argparse
+
+    p = argparse.ArgumentParser(
+        description="Evaluate a kgfm checkpoint with MRR / Hit@k / nDCG."
+    )
+    add_arguments(p)
+    run_from_args(p.parse_args(argv))
 
 
 if __name__ == "__main__":
