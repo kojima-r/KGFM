@@ -3,7 +3,7 @@
 # kgfm 5.1 h). Use resume_chembl.sh if it is interrupted.
 #
 # Same publication-grade choices as config_large.yaml, with more training
-# (60k steps = 15.4M examples seen) and a larger, harder KG.
+# (60k steps = 30.7M examples seen) and a larger, harder KG.
 #
 # Sized for a single H200 (143 GB). Runtime estimates come from measured
 # throughput on this machine, not guesses:
@@ -14,8 +14,13 @@
 # edge, per query). ULTRA runs on CPU because its rspmm kernel crashes on
 # sm_90, which makes it the dominant term in every config below — skipping it
 # (run only `kgfm bench run` + `kgfm-motif`) roughly halves the wall clock.
+#
+# See config_large.yaml for the two-level layout (top level / defaults: /
+# cells:).
 
 run_label: chembl_xlarge
+
+# --- run-level ---
 
 # |E| = 419,252 at this cap (measured by a prep run, not estimated)
 max_train: 400000
@@ -26,25 +31,30 @@ encoders: [ngram, transformer]
 freezes: ["off", "on"]
 protocols: [pooled, filtered]
 
-max_steps: 60000
-# One batch size for every cell on purpose: max_steps then means the same
-# amount of data for ngram and transformer, so their curves are comparable
-# step-for-step. B is also a *modeling* knob here — in_batch_negative_loss
-# scores each (h,r) against every other tail in the batch, so B-1 is the
-# number of negatives.
-#
-# 512 is measured, not guessed. On this H200, per training step:
-#   transformer  B=256  1,127 ex/s  12.3 GiB | B=512  3,014 ex/s  22.2 GiB
-#                B=384  2,610 ex/s  17.2 GiB | B=768  2,919 ex/s  32.2 GiB
-#   ngram        B=256 17,690 ex/s   5.1 GiB | B=4096 21,904 ex/s  5.2 GiB
-# The transformer peaks at 512 (768 is slower and uses 45% more memory), and
-# ngram is within 5% of its plateau there. 22 GiB of 143 GiB leaves plenty of
-# headroom for the eval passes, which encode the whole tail vocabulary.
-batch_size: 512
-proj_dim: 256
+# --- every cell ---
+defaults:
+  max_steps: 60000
 
-n_eval_triples: 12000
-pool_size: 12000
+  # See config_large.yaml for the measured throughput/memory table behind 512.
+  # Under DDP the in-batch logit matrix is built per rank, so this is the
+  # per-GPU batch and --nproc does not change the negative count.
+  batch_size: 512
+  proj_dim: 256
 
-max_filter_tails: 460000
-max_filter_rows: 10000000
+  n_eval_triples: 12000
+  pool_size: 12000
+
+  max_filter_tails: 460000
+  max_filter_rows: 10000000
+
+# --- one cell at a time ---
+cells:
+  # 60k steps is 2.4x the large run, so the cell that already overfit there
+  # has more room to do it. Same treatment, slightly stronger.
+  transformer:
+    encoder_weight_decay: 0.01
+    head_weight_decay: 0.0
+    encoder_dropout: 0.15
+
+  transformer_frozen:
+    head_dropout: 0.1

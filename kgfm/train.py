@@ -31,7 +31,7 @@ from .data import (
     read_file_list,
     split_files_three_way,
 )
-from .encoders import make_encoder
+from .encoders import ENCODER_PRESETS, is_transformer, make_encoder
 from .eval import evaluate
 from .losses import (
     DEFAULT_LOSS,
@@ -40,6 +40,7 @@ from .losses import (
     compute_loss,
     duplicate_tail_mask,
 )
+from .heads import DEFAULT_HEAD, HEADS, is_trainable
 from .model import DistMultScorer
 from .utils import pick_free_gpu
 
@@ -67,6 +68,8 @@ class TrainConfig:
     transformer_pooling: str = "mean"
     freeze_encoder: bool = False
     proj_dim: Optional[int] = None
+    # Projection head between encoder and score; see kgfm/heads.py.
+    head: str = DEFAULT_HEAD
     # Loader
     max_text_len: int = 512
     batch_size: int = 256
@@ -161,7 +164,7 @@ def default_lr(encoder: str, freeze_encoder: bool = False) -> float:
     A frozen encoder trains only the projection head, which is a small
     from-scratch layer — so it takes the large rate, not the fine-tuning one.
     """
-    if encoder.lower() in ("transformer", "bert", "hf") and not freeze_encoder:
+    if is_transformer(encoder) and not freeze_encoder:
         return TRANSFORMER_LR
     return NGRAM_LR
 
@@ -487,7 +490,7 @@ def train(cfg: TrainConfig) -> None:
     )
     scorer_raw = DistMultScorer(
         encoder, proj_dim=cfg.proj_dim, normalize=True,
-        head_dropout=cfg.head_dropout,
+        head_dropout=cfg.head_dropout, head=cfg.head,
     ).to(device)
 
     # ---- Resume: load model state BEFORE DDP wrap so DDP's initial
@@ -508,7 +511,7 @@ def train(cfg: TrainConfig) -> None:
     n_total = sum(p.numel() for p in scorer_raw.parameters())
     n_trainable = sum(p.numel() for p in scorer_raw.parameters() if p.requires_grad)
     mprint(
-        f"[init] encoder={cfg.encoder} dim={scorer_raw.dim} "
+        f"[init] encoder={cfg.encoder} head={cfg.head} dim={scorer_raw.dim} "
         f"params total={n_total:,} trainable={n_trainable:,}"
     )
 
@@ -930,6 +933,7 @@ def config_from_args(a: argparse.Namespace) -> TrainConfig:
         transformer_pooling=a.transformer_pooling,
         freeze_encoder=a.freeze_encoder,
         proj_dim=a.proj_dim,
+        head=a.head,
         max_text_len=a.max_text_len,
         batch_size=a.batch_size,
         per_device_train_batch_size=a.per_device_train_batch_size,

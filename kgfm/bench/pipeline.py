@@ -99,14 +99,24 @@ def run(cfg: BenchConfig) -> Path:
     logger.log(f"    gpu        = {_gpu_line()}")
     logger.log(f"    caps       = train={cfg.max_train} valid={cfg.max_valid} "
                f"test={cfg.max_test}")
-    logger.log(f"    kgfm       = max_steps={cfg.max_steps} batch_size={cfg.batch_size} "
-               f"transformer_bs={cfg.transformer_bs()} proj_dim={cfg.proj_dim} "
-               f"nproc={cfg.nproc}")
     logger.log(f"    sweep      = encoders={cfg.encoders} freezes={cfg.freezes} "
-               f"protocols={cfg.protocols}")
-    logger.log(f"    logging    = log_every={cfg.resolved_log_every()} "
-               f"eval_every={cfg.resolved_eval_every()} "
-               f"valid_loss_batches={cfg.valid_loss_batches}")
+               f"protocols={cfg.protocols} nproc={cfg.nproc}")
+    # One line per cell rather than one line of global settings: with `cells:`
+    # in play there is no single batch size or step count to print, and the
+    # resolved value is the thing worth recording.
+    for tag in cfg.cell_tags():
+        cell = cfg.resolve_cell(tag)
+        extra = "".join(
+            f" {key}={cell[key]}" for key in (
+                "proj_dim", "lr", "loss", "weight_decay",
+                "encoder_weight_decay", "head_weight_decay",
+                "encoder_dropout", "head_dropout",
+            ) if cell[key] is not None
+        )
+        logger.log(f"    cell {tag:<19} max_steps={cell['max_steps']} "
+                   f"batch_size={cell['batch_size']} "
+                   f"eval_every={cell['eval_every']}{extra}"
+                   + ("   <- cells:" if cfg.cells.get(tag) else ""))
     if cfg.skip:
         logger.log(f"    skipping   = {', '.join(cfg.skip)}")
     logger.log("")

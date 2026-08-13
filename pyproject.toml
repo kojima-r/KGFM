@@ -40,6 +40,10 @@ transformer = [
     # CUDA extension), so we cap transformers at the last 4.x release.
     "transformers>=4.30,<5.0",
 ]
+# `kgfm hf` — publishing a trained scorer to the HuggingFace Hub.
+hf = [
+    "huggingface_hub>=0.20",
+]
 # Richer `kgfm report` charts. Without these the report still renders, using
 # a built-in SVG fallback.
 report = [

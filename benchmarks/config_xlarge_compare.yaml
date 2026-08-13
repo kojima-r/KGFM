@@ -1,0 +1,126 @@
+# Architecture comparison — which pretrained text encoder, and which
+# projection head, actually helps on ChEMBL.
+#
+# This is a different question from config_xlarge.yaml, which fixes the
+# architecture and pushes the scale. Here the data scale is held at the xlarge
+# settings so the numbers land on the same axis, and the sweep moves along
+# `encoders` x `heads` x `freezes` instead.
+#
+# 28 cells: every preset in kgfm/encoders.py:ENCODER_PRESETS that was verified
+# to load and run in this environment, times two heads, times both freeze
+# settings wherever both are possible.
+#   ngram          fine-tune only  — there is no LM to freeze          ->  2
+#   6 x mid-size   fine-tune + frozen                                  -> 24
+#   e5-mistral-7b  frozen only (frozen_only; see below)                ->  2
+#
+# WHAT IS HELD CONSTANT, AND WHY IT MATTERS
+#   batch_size: 256 for every cell. B is not just throughput here — the loss
+#   scores each (h,r) against every other tail in the batch, so B-1 IS the
+#   number of negatives. A comparison run at different batch sizes would be
+#   confounding architecture with negative count, so every cell gets the same
+#   one, and it has to be the largest the *worst* cell can take.
+#
+#   256 is that value, established by running the real `kgfm bench cell` on an
+#   idle H200 rather than by an in-process estimate:
+#       bge-large + mlp, B=512   OOM (needed ~136 GiB of 139.8, died in the
+#                                first training forward)
+#       bge-large + mlp, B=384   OOM (peaked at 142,957 MiB of 143,771)
+#       bge-large + mlp, B=256   OK
+#   and B=256 was then confirmed end to end, filtered protocol included, for
+#   bge-large, e5-large, gte-large and xlm-roberta-large. An earlier estimate
+#   of 56.4 GiB at B=512 came from a standalone script and was simply wrong;
+#   the numbers below all come from the command the sweep actually runs.
+#
+#   proj_dim: 256 for every cell. The encoders have very different widths
+#   (ngram 256, BERT/mpnet 768, bge/e5/gte/xlm-r 1024, e5-mistral 4096);
+#   projecting all of them to 256 means the DistMult score is computed in the
+#   same dimension regardless, so the comparison is of representation quality
+#   and not of how many dimensions each model was allowed to score in.
+#
+#   max_steps: 6000 for every cell = 1.54M examples each. Equal steps at equal
+#   batch size is equal data. This is lower than config_xlarge.yaml's 60000
+#   because there are 28 cells rather than 3 — the budget buys breadth here,
+#   not depth, and depth is what config_xlarge.yaml is for.
+#
+# MEASURED at B=256 via `kgfm bench cell`, fine-tuning, 12 steps incl. warmup
+# (so these are conservative — steady state is faster):
+#   bge-large  615 ex/s | e5-large  614 | gte-large  610 | xlm-roberta-large 842
+# ngram is ~17,000 ex/s (observed in a real run), and frozen cells are roughly
+# 1.5x their fine-tuned counterpart since there is no backward through the LM.
+# Extrapolating over all 28 cells gives ~15 h of training, of which the two 7B
+# cells are about a third. Evaluation adds roughly 3 h (56 passes; each
+# filtered pass encodes a 460k tail vocabulary). Budget a day; resume if it
+# slips. The run log prints the real rate per cell — trust that over this
+# comment.
+#
+# Run with:  bash benchmarks/run_chembl_xlarge_compare.sh
+# Two GPUs:  bash benchmarks/run_chembl_xlarge_compare.sh --nproc 2
+
+run_label: chembl_xlarge_compare
+
+# --- run-level ---
+
+# Same KG as config_xlarge.yaml, so the numbers sit on the same axis.
+# |E| = 419,252 at this cap (measured by a prep run, not estimated)
+max_train: 400000
+max_valid: 12000
+max_test: 12000
+
+# Every verified preset. Two more were tried and rejected as always-crashing in
+# this environment (deberta-v3-large, gte-qwen2-7b) — see ENCODER_PRESETS for
+# the specific incompatibility in each case.
+encoders:
+  - ngram                # no pretraining at all — the floor to beat
+  - bert-multilingual    # the previous default, so old runs stay comparable
+  - mpnet                # 110M sentence-transformer
+  - bge-large            # 335M, strong retrieval encoder
+  - e5-large             # 335M, different pretraining recipe from bge
+  - gte-large            # 335M, a third recipe
+  - xlm-roberta-large    # 560M, multilingual, not retrieval-pretrained
+  - e5-mistral-7b        # 7B. frozen_only: 3B sequences/step cannot be tuned
+
+# `auto` is deliberately absent: it means "Identity when the width already
+# matches", which would silently give ngram no head at all while every other
+# encoder got a Linear — the one thing this comparison must not do.
+heads: [linear, mlp]
+
+# "on" = train the head only, the "did the LM already know this?" ablation.
+# Cells where one of these is impossible are dropped by
+# BenchConfig.cell_specs(), not by editing this list.
+freezes: ["off", "on"]
+
+protocols: [pooled, filtered]
+
+# --- every cell ---
+defaults:
+  max_steps: 6000
+  # 256, not 512: see the batch-size note at the top. This is the largest
+  # value the heaviest cell (bge/e5/gte fine-tuning at 1024 dim) survives.
+  batch_size: 256
+  proj_dim: 256
+
+  # The fine-tuned transformers are the cells that overfit — measured on the
+  # 2026-08-09 large run, train loss kept falling while valid loss rose after
+  # step 12.5k. Set here rather than per cell because it is a no-op everywhere
+  # it does not apply: a frozen encoder's parameters have requires_grad=False,
+  # so param_groups() never puts them in a decay group at all.
+  encoder_weight_decay: 0.01
+  # The head is one Linear (or a small MLP); decaying it is not the lever.
+  head_weight_decay: 0.0
+
+  n_eval_triples: 12000
+  pool_size: 12000
+
+  max_filter_tails: 460000
+  max_filter_rows: 10000000
+
+# --- one cell at a time ---
+cells:
+  # ngram is the exception to the decay above: its EmbeddingBag *is* the
+  # encoder and it trains from scratch, so decaying it changes the baseline
+  # this whole comparison is measured against. Left at 0 so the ngram row
+  # means the same thing it does in config_large.yaml.
+  ngram_linear:
+    encoder_weight_decay: 0.0
+  ngram_mlp:
+    encoder_weight_decay: 0.0

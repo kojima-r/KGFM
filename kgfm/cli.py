@@ -5,6 +5,7 @@
     kgfm bench ...      kgfm's ChEMBL benchmark (prep + sweep)
     kgfm viz ...        project a checkpoint's h / t embeddings to 2D
     kgfm report ...     collect a run directory's results into one table
+    kgfm hf    ...      publish a trained scorer to the HuggingFace Hub
 
 The baselines it is compared against are separate methods with separate
 commands — `kgfm-ultra` and `kgfm-motif` (see `kgfm.baselines`). They share
@@ -33,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Import the functions, not the modules: `kgfm/__init__.py` re-exports a
     # `train` function that shadows the `kgfm.train` submodule attribute.
+    from . import hf as hf_mod
     from . import report as report_mod
     from . import viz as viz_mod
     from .bench import cli as bench_cli
@@ -62,6 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
         "report", help="collect a run directory's results into one table")
     report_mod.add_arguments(report_p)
     report_p.set_defaults(func=report_mod.run_from_args)
+
+    hf_p = sub.add_parser(
+        "hf", help="publish a trained scorer to the HuggingFace Hub")
+    hf_mod.add_arguments(hf_p)
+    hf_p.set_defaults(func=hf_mod.run_from_args)
 
     return p
 

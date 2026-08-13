@@ -127,6 +127,7 @@ kgfm report --out-dir latest
 | スクリプト | 中身 |
 |---|---|
 | `run_chembl.sh` / `_middle.sh` / `_large.sh` / `_xlarge.sh` | 上記を `--config benchmarks/config_*.yaml` で |
+| `run_chembl_large_2gpu.sh` / `_xlarge_2gpu.sh` | 同じ config に `--nproc 2` を足すだけ |
 | `resume_chembl.sh` | 同上 + `--resume <target>` |
 | `setup_baselines.sh` | `kgfm-ultra --setup` と `kgfm-motif --setup` |
 | `setup_baseline_env.sh` | ベースライン用 conda env (`kgfm-ultra`) を構築 |
@@ -192,13 +193,99 @@ kgfm bench configs                       # 同梱の設定ファイル一覧と�
 | `config_middle.yaml` | 中規模 | 約 4.3 時間（6 時間枠） |
 | `config_large.yaml` | 論文掲載レベル | 約 10.8 時間（12 時間枠） |
 | `config_xlarge.yaml` | 論文掲載レベル・最大 | 約 21.4 時間（24 時間枠） |
+| `config_xlarge_compare.yaml` | アーキテクチャ比較（28 セル） | 約 19 時間（学習 15.9h + 評価 3h） |
 
 ```bash
 bash benchmarks/run_chembl.sh          # small
 bash benchmarks/run_chembl_middle.sh   # middle
 bash benchmarks/run_chembl_large.sh    # large
 bash benchmarks/run_chembl_xlarge.sh   # xlarge
+bash benchmarks/run_chembl_xlarge_compare.sh   # エンコーダ/ヘッド比較
 ```
+
+#### アーキテクチャ比較
+
+`config_xlarge_compare.yaml` はデータ規模を xlarge に固定したまま
+`encoders × heads × freezes` を振ります（**28 セル**）。確認済みプリセット
+全 8 種 × `heads: [linear, mlp]` × `freezes: [off, on]` で、両方の freeze が
+可能なものはすべて両方を実行します（ngram の frozen と 7B の fine-tune は
+`cell_specs()` が自動的に落とします）。エンコーダとヘッドの
+一覧・プリセット名はトップレベルの
+[README.md「エンコーダとヘッド」](../README.md#エンコーダとヘッド)を参照。
+
+```bash
+bash benchmarks/run_chembl_xlarge_compare.sh
+bash benchmarks/run_chembl_xlarge_compare.sh --encoders ngram,bge-large --heads linear
+```
+
+全セルで `batch_size: 512` と `proj_dim: 256` を固定しています。B-1 は負例数
+そのもの、`proj_dim` はスコア計算の次元なので、セルごとに変えると
+アーキテクチャの差と交絡するためです。`e5-mistral-7b` は 14 GB の初回
+ダウンロードが発生します。
+
+#### 2 GPU で動かす
+
+`_2gpu.sh` は large / xlarge と**同じ config**（＝同じスケール）を
+`--nproc 2` で回すだけです。config はスケールを記述するもので GPU 台数は
+フラグ、という区分に従っているため `config_large_2gpu.yaml` は作りません。
+
+```bash
+bash benchmarks/run_chembl_large_2gpu.sh    # config_large.yaml  + --nproc 2
+bash benchmarks/run_chembl_xlarge_2gpu.sh   # config_xlarge.yaml + --nproc 2
+```
+
+**負例数は GPU 台数で変わりません。** `in_batch_negative_loss` の `[B,B]`
+行列は各 rank のローカルなマイクロバッチから作られ、kgfm には埋め込みの
+all_gather がどこにもありません。`batch_size: 512` は
+`train._resolve_per_device_batch_size` により**1 GPU あたり** 512 になるので、
+負例数は 1 GPU 実行と同じ 511 のままです。変わるのはグローバルバッチ
+（512 × 2 = 1024）で、1 step あたり 2 倍のサンプルで勾配を平均します。
+
+したがって 2 GPU 実行は 1 GPU 実行の step 単位の再現ではありません。
+**負例数と所要時間はそのままで、見るデータ量が 2 倍**になります
+（large なら 25,000 step で 12.8M → 25.6M サンプル）。1 GPU と同じ学習量に
+したい場合は step を半分にしてください:
+
+```bash
+bash benchmarks/run_chembl_large_2gpu.sh --max-steps 12500
+```
+
+**2 台目の GPU が増やすのは「データ量」より「ファイル多様性」です。**
+ChEMBL の TSV は 1 ファイル 10,000,000 行で、ローダは各ファイルを順に
+読み切る実装です。large の 25,000 step × B=512 は 1 worker あたり 3.2M 行
+しか消費しないので、**最初の 1 ファイルすら読み終わりません**。
+`num_workers=4` なので 1 GPU 実行が触るのは 85 ファイル中およそ **4 個**
+（各 32% まで）、2 GPU なら worker が 8 個で **8 個**です。ChEMBL は
+activity ID でファイル分割されており 1 ファイル＝1 つのエンティティ集団、
+そして train/valid のギャップはまさにその集団シフトなので、2 GPU 目は
+スループットではなく**エンティティ多様性**を買っていることになります。
+
+1 GPU のまま多様性を上げたい場合は `max_rows_per_file`（cell 設定）で
+深さと広さを交換できます。
+
+```yaml
+defaults:
+  max_rows_per_file: 500000   # 1 ファイル 50 万行で次へ = 触るファイル数が約 20 倍
+```
+
+**学習率は変えていません。** 実効バッチが 2 倍なら lr を上げるのが定石ですが、
+実測（ngram, 1000 step, global_bs=1024, valid loss / pooled MRR）では
+
+| lr | valid loss | MRR |
+|---|---|---|
+| 1e-3（既定） | **4.656** | 0.2013 |
+| 1.4e-3 | 4.754 | 0.1941 |
+| 2e-3 | 4.697 | 0.2070 |
+
+と単調でなく、差も 0.1 nats 未満です（同一設定 3 回の再実行はビット単位で
+一致したので、この差はノイズではなく本当に小さいということです）。
+そもそも `--lr` は全セルを 1 つの値で上書きしてしまい、既定がエンコーダごと
+（ngram 1e-3 / transformer 3e-5）である以上それ自体が不適切です。どうしても
+変えるなら `cells: <tag>: lr:` を使ってください。
+
+なお `--per-device-train-batch-size` は**渡さないでください**。これは全セル
+共通の上書きなので、`transformer_batch_size` によるエンコーダごとの
+バッチサイズの区別を潰してしまいます。
 
 ### 所要時間の内訳
 
@@ -259,16 +346,68 @@ tail 語彙全体をエンコードする評価パスにも十分な余裕が残
 > なり、しかも**所要時間は約 25% 減ります**（スループットが 2.7 倍のため）。
 > 負例も 255 → 511 に増えます。
 
-優先順位は **デフォルト → 設定ファイル → コマンドラインの flag** です。優先順位は **デフォルト → 設定ファイル → コマンドラインの flag** です。
+優先順位は **デフォルト → `defaults:` → `cells:` → コマンドラインの flag** です。
 ファイルに書いた値をその場で上書きできます。
 
 ```bash
 bash benchmarks/run_chembl.sh --max-steps 1000   # small.yaml の 200 を上書き
 ```
 
-`BenchConfig` にある設定はすべて書けます。**未知のキーは黙って無視せず
-エラー**にして、有効なキー一覧を表示します（タイポ対策）。使った設定
-ファイルのパスは `meta.json` に記録されます。
+#### 設定ファイルは 2 階層
+
+設定には性質の違う 2 種類があるので、ファイルもその形にしています。
+
+| 階層 | 何を書くか | 例 |
+|---|---|---|
+| トップレベル | **run 全体**の設定。セルごとに変えられない | `max_train`, `encoders`, `freezes`, `nproc` |
+| `defaults:` | **全セル共通**のセル設定 | `max_steps`, `batch_size`, `proj_dim` |
+| `cells: <tag>:` | **そのセルだけ**の設定 | `transformer: {batch_size: 64}` |
+
+`<tag>` は `<encoder>` または `<encoder>_frozen`（`sweep.cell_tag` と同じ）で、
+`encoders` × `freezes` が実際に生成するセルでなければエラーになります。
+
+```yaml
+max_train: 250000                 # run 全体
+encoders: [ngram, transformer]
+freezes: ["off", "on"]
+
+defaults:                         # 全セル
+  max_steps: 25000
+  batch_size: 512
+  proj_dim: 256
+
+cells:                            # このセルだけ
+  transformer:
+    encoder_weight_decay: 0.01    # fine-tune 側だけ過学習するので
+    head_weight_decay: 0.0
+  transformer_frozen:
+    head_dropout: 0.1             # head しか学習しないセル
+```
+
+**コマンドラインの flag は「全セル共通の単一オーバーライド」**で、`cells:` の
+後に適用されるため per-cell 設定にも勝ちます。セルごとに変えたいものは
+必ず設定ファイル側に書いてください。
+
+```bash
+kgfm bench run --config large --batch-size 64   # 全セルが 64 になる
+```
+
+実際に解決された値は run.log の先頭にセルごとに 1 行ずつ出ます:
+
+```
+cell ngram               max_steps=25000 batch_size=512 eval_every=2500 proj_dim=256
+cell transformer         max_steps=25000 batch_size=512 eval_every=2500 proj_dim=256 encoder_weight_decay=0.01 head_weight_decay=0.0   <- cells:
+cell transformer_frozen  max_steps=25000 batch_size=512 eval_every=2500 proj_dim=256 head_dropout=0.1   <- cells:
+```
+
+**未知のキーは黙って無視せずエラー**にして、有効なキー一覧を表示します。
+セル設定をトップレベルに書いた場合・run 設定を `defaults:` に書いた場合・
+`cells:` のタグを打ち間違えた場合も、それぞれ「どこに書くべきか」を示す
+エラーになります。使った設定ファイルのパスは `meta.json` に記録されます。
+
+> エンコーダごとにバッチサイズを変えていた `transformer_batch_size` /
+> `--transformer-batch-size` は廃止しました。`cells: transformer:
+> batch_size:` が一般形です。
 
 > **YAML の落とし穴**: `freezes: [off, on]` の `off` / `on` は YAML では
 > **真偽値** (False / True) として解釈されます。同梱ファイルでは
@@ -286,7 +425,7 @@ bash benchmarks/run_chembl.sh --max-steps 1000   # small.yaml の 200 を上書�
 | `--conda-env NAME` | `kgfm` | 子プロセスを動かす conda env |
 | `--max-train N` / `--max-valid N` / `--max-test N` | 50000 / 2000 / 2000 | ChEMBL prep の三つ組キャップ |
 | `--max-steps N` | 200 | kgfm の学習ステップ数 |
-| `--batch-size N` | 256 | kgfm の学習バッチサイズ (per-device) |
+| `--batch-size N` | 256 | kgfm の学習バッチサイズ (per-device・**全セル**) |
 | `--transformer-batch-size N` | （`--batch-size` と同じ） | transformer エンコーダ系のセルだけバッチサイズを上書き。BERT-base のフル fine-tune は B=1024 で OOM するため、こちらで個別に下げる |
 | `--proj-dim N` | （未指定 = `None`） | DistMult 直前に学習可能な `Linear` 射影を挿入。`--freezes on` を使う場合は必須（凍結 LM + `proj_dim=None` だと学習可能パラメータが 0 になる）。ngram に対しても同値であれば `nn.Identity` に縮退するため無害 |
 | `--protocols LIST` | `pooled,filtered` | 最終評価プロトコルのスイープ |
@@ -936,6 +1075,8 @@ benchmarks/                 # シェルは薄いラッパのみ
 ├── run_chembl.sh           # bench run → ultra → motif → report
 ├── run_chembl_large.sh     # --config benchmarks/config_large.yaml
 ├── run_chembl_xlarge.sh    # --config benchmarks/config_xlarge.yaml
+├── run_chembl_large_2gpu.sh   # 同上 + --nproc 2
+├── run_chembl_xlarge_2gpu.sh  # 同上 + --nproc 2
 ├── small.yaml / large.yaml / xlarge.yaml   # スケール設定
 ├── resume_chembl.sh        # 上記 + --resume
 ├── setup_baselines.sh      # ULTRA / MOTIF の clone + 依存チェック

@@ -17,6 +17,7 @@ import argparse
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from ..heads import HEADS
 from ..losses import DEFAULT_LOSS, LOSSES
 from ..runs import RunLogger, resolve_run_dir
 from . import cell, pipeline, prep, sweep
@@ -70,15 +71,25 @@ def _add_data(p: argparse.ArgumentParser) -> None:
 def _add_sweep(p: argparse.ArgumentParser) -> None:
     p.add_argument("--encoders", type=_csv, default=None,
                    help="Comma-separated: ngram,transformer")
+    p.add_argument("--heads", type=_csv, default=None,
+                   help=f"Comma-separated projection heads to sweep "
+                        f"({','.join(HEADS)}). More than one adds a _<head> "
+                        f"segment to every cell tag.")
     p.add_argument("--freezes", type=_csv, default=None,
-                   help="Comma-separated: off,on. 'on' needs --proj-dim.")
+                   help="Comma-separated: off,on. 'on' needs a head with "
+                        "parameters (proj-dim, or head=linear/mlp).")
     p.add_argument("--protocols", type=_csv, default=None,
                    help="Comma-separated: pooled,filtered")
+    # Everything from here down is a cell-level setting, and passing it on the
+    # command line is a *single global override*: it is applied to every cell
+    # after (and therefore wins over) any `cells:` block in the config file.
+    # To vary one of these per cell, put it under `cells: <tag>:` in the YAML
+    # — that is what the two levels are for. `--transformer-batch-size` used
+    # to live here and is now `cells: transformer: batch_size:`.
     p.add_argument("--max-steps", type=int, default=None)
-    p.add_argument("--batch-size", type=int, default=None)
-    p.add_argument("--transformer-batch-size", type=int, default=None,
-                   help="Batch size for transformer cells only (encode_triple "
-                        "bundles h+r+t, so these need a smaller batch).")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Batch size for EVERY cell. Per-cell values belong in "
+                        "the config file under `cells:`.")
     p.add_argument("--proj-dim", type=int, default=None)
     p.add_argument("--per-device-train-batch-size", type=int, default=None)
     p.add_argument("--per-device-eval-batch-size", type=int, default=None)
@@ -117,6 +128,10 @@ def _add_sweep(p: argparse.ArgumentParser) -> None:
                    action="store_const", const=False, default=None,
                    help="Keep duplicate tails as in-batch negatives "
                         "(masking them is the default).")
+    p.add_argument("--max-rows-per-file", type=int, default=None,
+                   help="Rows to read from each TSV before moving to the next. "
+                        "Unset reads to the end — on ChEMBL (10M rows/file) a "
+                        "run then trains on ~1 file per dataloader worker.")
     p.add_argument("--valid-loss-batches", type=int, default=None,
                    help="Held-out batches averaged into the validation loss "
                         "plotted against the training loss (0 disables).")
@@ -241,8 +256,17 @@ def _cmd_configs(args: argparse.Namespace) -> None:
     base = BenchConfig()
     for name in names:
         print(f"[{CONFIG_DIR}/{name}.yaml]")   # name already carries the prefix
-        for key, value in load_config_file(name).items():
+        overrides = load_config_file(name)
+        # `cells` is a nested mapping; printing it inline is unreadable, and it
+        # is the part a reader most wants to see, so give it its own block
+        # after the flat settings.
+        cells = overrides.pop("cells", {})
+        for key, value in overrides.items():
             if key == "config_file":
                 continue
             print(f"    {key:26s} {getattr(base, key, None)!r:>24} -> {value!r}")
+        for tag, block in cells.items():
+            print(f"    cells: {tag}")
+            for key, value in sorted(block.items()):
+                print(f"        {key:22s} {getattr(base, key, None)!r:>24} -> {value!r}")
         print()

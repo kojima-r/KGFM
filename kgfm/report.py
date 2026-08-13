@@ -200,6 +200,13 @@ def _row(record: Dict[str, Any]) -> Dict[str, str]:
     method = record.get("method", "?")
     encoder = record.get("encoder")
     if encoder:
+        # Every axis the sweep varies has to show up here, or an architecture
+        # comparison collapses several cells onto one indistinguishable label.
+        # "auto" is omitted because it is the default and naming it would add
+        # noise to every pre-existing single-head run.
+        head = record.get("head")
+        if head and head != "auto":
+            encoder = f"{encoder}, {head}"
         # Distinguish frozen-LM rows so the table doesn't collapse them onto
         # the fine-tuned cells of the same encoder.
         if record.get("freeze_encoder"):

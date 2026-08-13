@@ -418,6 +418,7 @@ def _load_scorer_from_checkpoint(
 ) -> DistMultScorer:
     """Reconstruct a DistMultScorer from a checkpoint saved by ``kgfm.train``."""
     from .encoders import make_encoder
+    from .heads import DEFAULT_HEAD
 
     ckpt = torch.load(ckpt_path, map_location=device)
     cfg = ckpt.get("config", {}) or {}
@@ -437,6 +438,7 @@ def _load_scorer_from_checkpoint(
     scorer = DistMultScorer(
         encoder, proj_dim=cfg.get("proj_dim"), normalize=True,
         head_dropout=cfg.get("head_dropout", 0.0),
+        head=cfg.get("head", DEFAULT_HEAD),
     ).to(device)
     scorer.load_state_dict(ckpt["model_state"])
     scorer.eval()

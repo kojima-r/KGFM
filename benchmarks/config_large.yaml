@@ -17,8 +17,18 @@
 # edge, per query). ULTRA runs on CPU because its rspmm kernel crashes on
 # sm_90, which makes it the dominant term in every config below — skipping it
 # (run only `kgfm bench run` + `kgfm-motif`) roughly halves the wall clock.
+#
+# ---------------------------------------------------------------------------
+# The file has two levels:
+#   top level   run-level settings. One value for the whole run.
+#   defaults:   cell-level settings applied to every cell.
+#   cells:      cell-level settings for one cell, keyed by <encoder>[_frozen].
+# A bench CLI flag overrides every cell, including anything under `cells:`.
+# ---------------------------------------------------------------------------
 
 run_label: chembl_large
+
+# --- run-level ---
 
 # |E| ~ 280,000 at this cap
 max_train: 250000
@@ -31,29 +41,51 @@ encoders: [ngram, transformer]
 freezes: ["off", "on"]
 protocols: [pooled, filtered]
 
-max_steps: 25000
-# One batch size for every cell on purpose: max_steps then means the same
-# amount of data for ngram and transformer, so their curves are comparable
-# step-for-step. B is also a *modeling* knob here — in_batch_negative_loss
-# scores each (h,r) against every other tail in the batch, so B-1 is the
-# number of negatives.
-#
-# 512 is measured, not guessed. On this H200, per training step:
-#   transformer  B=256  1,127 ex/s  12.3 GiB | B=512  3,014 ex/s  22.2 GiB
-#                B=384  2,610 ex/s  17.2 GiB | B=768  2,919 ex/s  32.2 GiB
-#   ngram        B=256 17,690 ex/s   5.1 GiB | B=4096 21,904 ex/s  5.2 GiB
-# The transformer peaks at 512 (768 is slower and uses 45% more memory), and
-# ngram is within 5% of its plateau there. 22 GiB of 143 GiB leaves plenty of
-# headroom for the eval passes, which encode the whole tail vocabulary.
-batch_size: 512
+# --- every cell ---
+defaults:
+  max_steps: 25000
 
-# Mandatory whenever freezes contains "on": with a frozen encoder and no
-# projection the optimizer sees zero trainable parameters. A no-op for ngram,
-# which is already 256-dim so the projection collapses to nn.Identity.
-proj_dim: 256
+  # One batch size for every cell on purpose: max_steps then means the same
+  # amount of data for ngram and transformer, so their curves are comparable
+  # step-for-step. B is also a *modeling* knob here — in_batch_negative_loss
+  # scores each (h,r) against every other tail in the batch, so B-1 is the
+  # number of negatives. Under DDP that matrix is built per rank, so B is the
+  # per-GPU batch and --nproc does not change the negative count.
+  #
+  # 512 is measured, not guessed. On this H200, per training step:
+  #   transformer  B=256  1,127 ex/s  12.3 GiB | B=512  3,014 ex/s  22.2 GiB
+  #                B=384  2,610 ex/s  17.2 GiB | B=768  2,919 ex/s  32.2 GiB
+  #   ngram        B=256 17,690 ex/s   5.1 GiB | B=4096 21,904 ex/s  5.2 GiB
+  # The transformer peaks at 512 (768 is slower and uses 45% more memory), and
+  # ngram is within 5% of its plateau there. 22 GiB of 143 GiB leaves plenty
+  # of headroom for the eval passes, which encode the whole tail vocabulary.
+  batch_size: 512
 
-n_eval_triples: 10000
-pool_size: 10000
+  # Mandatory whenever freezes contains "on": with a frozen encoder and no
+  # projection the optimizer sees zero trainable parameters. A no-op for
+  # ngram, which is already 256-dim so the projection collapses to
+  # nn.Identity.
+  proj_dim: 256
 
-max_filter_tails: 310000
-max_filter_rows: 10000000
+  n_eval_triples: 10000
+  pool_size: 10000
+
+  max_filter_tails: 310000
+  max_filter_rows: 10000000
+
+# --- one cell at a time ---
+cells:
+  # The only cell that overfits: on the 2026-08-09 large run its train loss
+  # kept falling (2.25 -> 1.97 over 25k steps) while valid loss bottomed at
+  # step 12.5k and rose to 4.84 by the end. The other two cells did not.
+  # Decay the encoder, leave the head alone — it is one Linear.
+  transformer:
+    encoder_weight_decay: 0.01
+    head_weight_decay: 0.0
+
+  # A frozen encoder trains only the projection head, so encoder-side
+  # regularization has nothing to act on; dropout on the head is the knob that
+  # still does something. This cell was the only one whose valid loss did not
+  # rise, so it gets a light touch.
+  transformer_frozen:
+    head_dropout: 0.1

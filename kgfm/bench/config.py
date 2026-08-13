@@ -4,9 +4,36 @@ Scale settings live in ``benchmarks/config_*.yaml`` and are selected with
 ``--config``. Keeping them as data rather than code means a new scale is a
 file you can diff and version, not a dict inside the package.
 
-Precedence is defaults <- config file <- explicit CLI flags: every CLI flag
-defaults to ``None``, the file fills the Nones, and anything the user actually
-typed wins over both.
+The file has two levels, because a sweep setting is one of two different
+things:
+
+* **run-level** keys sit at the top of the file and describe the run as a
+  whole — which data, which cells exist, how many GPUs. They cannot vary by
+  cell.
+* **cell-level** keys describe *one training pass*. They go under
+  ``defaults:`` to apply to every cell, and under ``cells: <tag>:`` to
+  override that for one cell. A tag is ``<encoder>`` or ``<encoder>_frozen``
+  (see ``BenchConfig.cell_specs``).
+
+::
+
+    max_train: 250000          # run-level
+    encoders: [ngram, transformer]
+
+    defaults:                  # every cell
+      max_steps: 25000
+      batch_size: 512
+
+    cells:                     # one cell
+      transformer:
+        batch_size: 64
+
+Precedence is dataclass defaults <- ``defaults:`` <- ``cells: <tag>:`` <-
+explicit CLI flags. The CLI comes last on purpose: every bench flag defaults
+to ``None`` and is a *single global override*, so passing one deliberately
+flattens the per-cell settings for every cell. That is the distinction the
+two levels exist to make — put anything that should differ per cell in the
+file, not on the command line.
 """
 
 from __future__ import annotations
@@ -15,7 +42,25 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ..encoders import ENCODER_PRESETS, is_frozen_only, is_transformer
+from ..heads import DEFAULT_HEAD, HEADS, is_trainable
+
 STEPS = ("prep", "sweep", "viz")
+
+# Settings that describe one training pass and may therefore differ per cell.
+# Everything not listed here is run-level and may only appear at the top of a
+# config file. Keep in sync with the `_add_*` groups in bench/cli.py.
+CELL_FIELDS = frozenset({
+    "max_steps", "batch_size", "proj_dim",
+    "per_device_train_batch_size", "per_device_eval_batch_size",
+    "gradient_accumulation_steps",
+    "log_every", "eval_every", "valid_loss_batches",
+    "lr", "loss", "loss_temperature",
+    "weight_decay", "encoder_weight_decay", "head_weight_decay",
+    "encoder_dropout", "head_dropout", "mask_duplicate_tails",
+    "n_eval_triples", "pool_size", "max_filter_tails", "max_filter_rows",
+    "max_rows_per_file",
+})
 PROTOCOLS = ("pooled", "filtered")
 FREEZES = ("off", "on")
 
@@ -53,14 +98,19 @@ class BenchConfig:
 
     # --- kgfm sweep ---
     encoders: List[str] = field(default_factory=lambda: ["ngram", "transformer"])
+    # Projection heads to sweep. With one entry the cell tags are unchanged;
+    # with more than one, each tag gains a `_<head>` segment so the cells stay
+    # distinguishable in the run directory and the report.
+    heads: List[str] = field(default_factory=lambda: [DEFAULT_HEAD])
     freezes: List[str] = field(default_factory=lambda: ["off"])
     protocols: List[str] = field(default_factory=lambda: ["pooled", "filtered"])
+    # --- cell-level defaults (see CELL_FIELDS). `defaults:` in a config file
+    # sets these; `cells: <tag>:` overrides them for one cell. A transformer
+    # cell often wants a smaller batch than an ngram one, because
+    # encode_triple bundles h+r+t into a single 3B-sequence encoder forward —
+    # that is now `cells: transformer: batch_size:`, not a special field.
     max_steps: int = 200
     batch_size: int = 256
-    # Transformer cells often need a smaller batch than ngram ones: encode_triple
-    # bundles h+r+t into a single 3B-sequence encoder forward, so B=1024 is a
-    # 3072-sequence BERT batch. None = use batch_size everywhere.
-    transformer_batch_size: Optional[int] = None
     # Required whenever `freezes` contains "on": with a frozen encoder and no
     # projection the model has zero trainable parameters.
     proj_dim: Optional[int] = None
@@ -89,6 +139,12 @@ class BenchConfig:
     head_dropout: Optional[float] = None
     # False negatives from repeated tails; on by default in kgfm.train.
     mask_duplicate_tails: Optional[bool] = None
+    # Rows to take from each TSV before moving to the next. None = read the
+    # file to the end, which on ChEMBL means never leaving it: every file is
+    # 10,000,000 rows, workers read sequentially, and a 25k-step run at B=512
+    # only pulls 3.2M rows per worker. So the default touches ~4 files of 85
+    # (one per worker, 32% in). Setting this trades depth for breadth.
+    max_rows_per_file: Optional[int] = None
     n_eval_triples: int = 5_000
     pool_size: int = 5_000
     max_filter_tails: int = 50_000
@@ -98,25 +154,70 @@ class BenchConfig:
     viz_reducer: str = "auto"          # auto -> umap when installed, else pca
     viz_max_points: int = 4_000        # a few thousand keeps the report light
 
+    # --- per-cell overrides, keyed by cell tag (`<encoder>[_frozen]`) ---
+    cells: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Flags the user actually typed. Applied *after* the per-cell overrides,
+    # because a CLI flag is a single global override by definition.
+    cli_overrides: Dict[str, Any] = field(default_factory=dict)
+
     # --- control ---
     skip: List[str] = field(default_factory=list)
     resume: Optional[str] = None         # None = fresh run; else a run target
 
-    def resolved_eval_every(self) -> int:
-        """Validation cadence: explicit if given, else ~10 points per run."""
-        if self.eval_every is not None:
-            return max(1, self.eval_every)
-        return max(1, self.max_steps // 10)
+    def cell_specs(self) -> List[tuple]:
+        """(encoder, head, freeze, tag) for every cell, in sweep order.
 
-    def resolved_log_every(self) -> int:
-        """Loss-logging cadence, capped so short runs still get a curve."""
-        return max(1, min(self.log_every, max(1, self.max_steps // 20)))
+        `freeze=on` is only a cell for pretrained encoders — there is no LM to
+        freeze in the ngram one, so it would duplicate its `off` cell.
+        """
+        specs: List[tuple] = []
+        multi_head = len(self.heads) > 1
+        for encoder in self.encoders:
+            for head in self.heads:
+                for freeze in self.freezes:
+                    if freeze == "on" and not is_transformer(encoder):
+                        continue
+                    # 7B-class presets cannot be fine-tuned here at all (3B
+                    # sequences per step), so their freeze=off cell is not a
+                    # cell — the same kind of rule as ngram x freeze=on.
+                    if freeze == "off" and is_frozen_only(encoder):
+                        continue
+                    # The head segment only appears when it distinguishes
+                    # something, so single-head configs keep the tags (and
+                    # therefore the result filenames) they have always had.
+                    tag = encoder + (f"_{head}" if multi_head else "")
+                    if freeze == "on":
+                        tag += "_frozen"
+                    specs.append((encoder, head, freeze, tag))
+        return specs
 
-    def transformer_bs(self) -> int:
-        return self.transformer_batch_size or self.batch_size
+    def cell_tags(self) -> List[str]:
+        """Just the tags — the identity of each cell in the run directory."""
+        return [spec[3] for spec in self.cell_specs()]
 
-    def cell_batch_size(self, encoder: str) -> int:
-        return self.batch_size if encoder == "ngram" else self.transformer_bs()
+    def resolve_cell(self, tag: str) -> Dict[str, Any]:
+        """Settings for one cell: defaults <- cells[tag] <- CLI overrides.
+
+        The CLI comes last because a bench flag is a single global override;
+        anything meant to differ per cell belongs in the file.
+        """
+        resolved = {name: getattr(self, name) for name in CELL_FIELDS}
+        resolved.update(self.cells.get(tag, {}))
+        resolved.update({k: v for k, v in self.cli_overrides.items()
+                         if k in CELL_FIELDS})
+
+        # Derived cadences, computed from *this cell's* max_steps: a cell may
+        # train for a different number of steps than its neighbours, and
+        # kgfm.train's own eval_every default of 1000 would skip validation
+        # entirely on a short one.
+        steps = int(resolved["max_steps"])
+        if resolved["eval_every"] is None:
+            resolved["eval_every"] = max(1, steps // 10)
+        else:
+            resolved["eval_every"] = max(1, int(resolved["eval_every"]))
+        resolved["log_every"] = max(1, min(int(resolved["log_every"]),
+                                           max(1, steps // 20)))
+        return resolved
 
     def validate(self) -> None:
         for name, values, allowed in (
@@ -135,13 +236,37 @@ class BenchConfig:
                 f"Invalid --skip value(s): {', '.join(bad_steps)} "
                 f"(use {'|'.join(STEPS)})"
             )
-        if "on" in self.freezes and self.proj_dim is None:
-            # Not fatal — the user may be probing — but it silently trains
-            # nothing, which is worth one line of warning.
-            print(
-                "[bench] warning: --freezes contains 'on' without --proj-dim; "
-                "frozen cells will have zero trainable parameters."
+        # A typo in a cell tag would otherwise be silently ignored — the cell
+        # would just run with the defaults and the override would vanish.
+        known = self.cell_tags()
+        unknown = [t for t in self.cells if t not in known]
+        if unknown:
+            raise SystemExit(
+                f"Unknown cell tag(s) in `cells:`: {', '.join(sorted(unknown))}\n"
+                f"This run's cells are: {', '.join(known) or '(none)'}\n"
+                "A tag is <encoder>[_<head>][_frozen] — the _<head> segment "
+                "appears only when more than one head is swept — and must be "
+                "a cell that `encoders` x `heads` x `freezes` produces."
             )
+        bad_heads = [h for h in self.heads if h not in HEADS]
+        if bad_heads:
+            raise SystemExit(
+                f"Invalid heads value(s): {', '.join(bad_heads)} "
+                f"(use {'|'.join(HEADS)})"
+            )
+        for encoder, head, freeze, tag in self.cell_specs():
+            if freeze != "on":
+                continue
+            cell = self.resolve_cell(tag)
+            # A frozen encoder trains only the head, so a head with no
+            # parameters means the cell trains nothing at all.
+            in_dim = ENCODER_PRESETS.get(encoder, {}).get("dim")
+            if not is_trainable(head, in_dim or 0, cell["proj_dim"]):
+                print(
+                    f"[bench] warning: cell {tag} is frozen and head={head} has "
+                    "no parameters; it would train nothing. Set proj_dim, or "
+                    "use head=linear/mlp/residual_mlp."
+                )
 
     def as_meta(self) -> Dict[str, Any]:
         """The parameter block recorded in meta.json."""
@@ -204,14 +329,70 @@ def load_config_file(path: str) -> Dict[str, Any]:
     if not isinstance(loaded, dict):
         raise SystemExit(f"{file_path}: expected a mapping at the top level")
 
-    known = {f.name for f in fields(BenchConfig)}
-    unknown = sorted(set(loaded) - known)
+    return _parse_config(loaded, file_path)
+
+
+def _check_cell_block(where: str, block: Any, file_path: Path) -> Dict[str, Any]:
+    """Validate one `defaults:` / `cells: <tag>:` mapping."""
+    if not isinstance(block, dict):
+        raise SystemExit(f"{file_path}: `{where}` must be a mapping")
+    unknown = sorted(set(block) - CELL_FIELDS)
     if unknown:
+        run_level = [k for k in unknown
+                     if k in {f.name for f in fields(BenchConfig)}]
+        hint = ""
+        if run_level:
+            plural = "s" if len(run_level) > 1 else ""
+            hint = (f"\n{', '.join(run_level)} {'are' if plural else 'is'} a "
+                    f"run-level setting{plural} — move "
+                    f"{'them' if plural else 'it'} to the top level of the file.")
         raise SystemExit(
-            f"{file_path}: unknown setting(s): {', '.join(unknown)}\n"
-            f"Valid settings: {', '.join(sorted(known))}"
+            f"{file_path}: unknown setting(s) under `{where}`: "
+            f"{', '.join(unknown)}{hint}\n"
+            f"Valid cell settings: {', '.join(sorted(CELL_FIELDS))}"
         )
-    overrides = {k: _coerce(k, v) for k, v in loaded.items()}
+    return dict(block)
+
+
+def _parse_config(loaded: Dict[str, Any], file_path: Path) -> Dict[str, Any]:
+    """Flatten a two-level config file into BenchConfig field overrides."""
+    all_fields = {f.name for f in fields(BenchConfig)}
+    # `cli_overrides` is populated from argparse, never from a file.
+    top_level = all_fields - CELL_FIELDS - {"cli_overrides"}
+
+    overrides: Dict[str, Any] = {}
+    cells: Dict[str, Dict[str, Any]] = {}
+    for key, value in loaded.items():
+        if key == "defaults":
+            # `defaults:` sets the cell-level fields on the dataclass itself,
+            # which is exactly what resolve_cell() starts from.
+            overrides.update(_check_cell_block("defaults", value, file_path))
+        elif key == "cells":
+            if not isinstance(value, dict):
+                raise SystemExit(f"{file_path}: `cells` must be a mapping of "
+                                 "cell tag -> settings")
+            for tag, block in value.items():
+                cells[str(tag)] = _check_cell_block(
+                    f"cells.{tag}", block, file_path
+                )
+        elif key in top_level:
+            overrides[key] = _coerce(key, value)
+        elif key in CELL_FIELDS:
+            raise SystemExit(
+                f"{file_path}: `{key}` is a cell-level setting and cannot sit "
+                f"at the top level.\nPut it under `defaults:` to apply it to "
+                f"every cell, or under `cells: <tag>:` for one cell."
+            )
+        else:
+            raise SystemExit(
+                f"{file_path}: unknown setting: {key}\n"
+                f"Run-level settings: {', '.join(sorted(top_level))}\n"
+                f"Cell-level settings (under `defaults:` / `cells:`): "
+                f"{', '.join(sorted(CELL_FIELDS))}"
+            )
+
+    if cells:
+        overrides["cells"] = cells
     overrides["config_file"] = str(file_path)
     return overrides
 
@@ -227,12 +408,19 @@ def available_configs() -> List[str]:
 def build_config(
     overrides: Dict[str, Any], config_path: Optional[str] = None
 ) -> BenchConfig:
-    """Compose defaults <- config file <- explicit CLI overrides."""
+    """Compose dataclass defaults <- config file <- explicit CLI overrides.
+
+    CLI values are also kept in `cfg.cli_overrides` so `resolve_cell` can
+    re-apply them *after* the per-cell block: a bench flag is a single global
+    override and must win over a per-cell setting, not lose to it.
+    """
     cfg = BenchConfig()
     if config_path:
         for key, value in load_config_file(config_path).items():
             setattr(cfg, key, value)
-    for key, value in overrides.items():
-        if value is not None and hasattr(cfg, key):
-            setattr(cfg, key, value)
+    typed = {k: v for k, v in overrides.items()
+             if v is not None and hasattr(cfg, k)}
+    for key, value in typed.items():
+        setattr(cfg, key, value)
+    cfg.cli_overrides = {k: v for k, v in typed.items() if k in CELL_FIELDS}
     return cfg

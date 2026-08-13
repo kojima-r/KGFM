@@ -603,9 +603,16 @@ def _method_key(record: Dict[str, Any]) -> Tuple[str, str]:
         # (ULTRA then MOTIF) rather than alphabetically.
         order = {"ULTRA": "2", "MOTIF": "3"}.get(method, "4")
         return (f"{order}_{method}", method)
-    tag = encoder + ("_frozen" if record.get("freeze_encoder") else "")
-    suffix = ", frozen" if record.get("freeze_encoder") else ""
-    return (f"1_{tag}", f"{method} ({encoder}{suffix})")
+    # The key has to name every axis the sweep varies, or two different cells
+    # share a section: their training curves would be interleaved under one
+    # heading and the head axis would be invisible. "auto" is omitted so runs
+    # that sweep a single head keep the section titles they have always had.
+    head = record.get("head")
+    parts = [encoder] + ([head] if head and head != "auto" else [])
+    if record.get("freeze_encoder"):
+        parts.append("frozen")
+    suffix = "".join(f", {p}" for p in parts[1:])
+    return (f"1_{'_'.join(parts)}", f"{method} ({encoder}{suffix})")
 
 
 def _method_sections(

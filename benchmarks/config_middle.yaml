@@ -12,8 +12,13 @@
 # edge, per query). ULTRA runs on CPU because its rspmm kernel crashes on
 # sm_90, which makes it the dominant term in every config below — skipping it
 # (run only `kgfm bench run` + `kgfm-motif`) roughly halves the wall clock.
+#
+# See config_large.yaml for the two-level layout (top level / defaults: /
+# cells:).
 
 run_label: chembl_middle
+
+# --- run-level ---
 
 # |E| ~ 182,000 at this cap (measured growth: 50k->72.7k, 200k->231k, 1M->685k)
 max_train: 150000
@@ -24,26 +29,38 @@ encoders: [ngram, transformer]
 freezes: ["off"]
 protocols: [pooled, filtered]
 
-max_steps: 20000
-# One batch size for every cell on purpose: max_steps then means the same
-# amount of data for ngram and transformer, so their curves are comparable
-# step-for-step. B is also a *modeling* knob here — in_batch_negative_loss
-# scores each (h,r) against every other tail in the batch, so B-1 is the
-# number of negatives.
-#
-# 512 is measured, not guessed. On this H200, per training step:
-#   transformer  B=256  1,127 ex/s  12.3 GiB | B=512  3,014 ex/s  22.2 GiB
-#                B=384  2,610 ex/s  17.2 GiB | B=768  2,919 ex/s  32.2 GiB
-#   ngram        B=256 17,690 ex/s   5.1 GiB | B=4096 21,904 ex/s  5.2 GiB
-# The transformer peaks at 512 (768 is slower and uses 45% more memory), and
-# ngram is within 5% of its plateau there. 22 GiB of 143 GiB leaves plenty of
-# headroom for the eval passes, which encode the whole tail vocabulary.
-batch_size: 512
+# --- every cell ---
+defaults:
+  max_steps: 20000
 
-# Evaluate the whole test split rather than truncating it.
-n_eval_triples: 6000
-pool_size: 6000
+  # One batch size for every cell on purpose: max_steps then means the same
+  # amount of data for ngram and transformer, so their curves are comparable
+  # step-for-step. B is also a *modeling* knob here — in_batch_negative_loss
+  # scores each (h,r) against every other tail in the batch, so B-1 is the
+  # number of negatives. Under DDP that matrix is built per rank, so B is the
+  # per-GPU batch and --nproc does not change the negative count.
+  #
+  # 512 is measured, not guessed. On this H200, per training step:
+  #   transformer  B=256  1,127 ex/s  12.3 GiB | B=512  3,014 ex/s  22.2 GiB
+  #                B=384  2,610 ex/s  17.2 GiB | B=768  2,919 ex/s  32.2 GiB
+  #   ngram        B=256 17,690 ex/s   5.1 GiB | B=4096 21,904 ex/s  5.2 GiB
+  # The transformer peaks at 512 (768 is slower and uses 45% more memory), and
+  # ngram is within 5% of its plateau there. 22 GiB of 143 GiB leaves plenty
+  # of headroom for the eval passes, which encode the whole tail vocabulary.
+  batch_size: 512
 
-# ~= |E|, so the filtered protocol is not silently truncated.
-max_filter_tails: 210000
-max_filter_rows: 5000000
+  # Evaluate the whole test split rather than truncating it.
+  n_eval_triples: 6000
+  pool_size: 6000
+
+  # ~= |E|, so the filtered protocol is not silently truncated.
+  max_filter_tails: 210000
+  max_filter_rows: 5000000
+
+# --- one cell at a time ---
+cells:
+  # Same treatment as config_large.yaml: the fine-tuned transformer is the
+  # cell that overfits, and the head is one Linear that does not need decay.
+  transformer:
+    encoder_weight_decay: 0.01
+    head_weight_decay: 0.0

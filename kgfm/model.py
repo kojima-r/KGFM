@@ -17,6 +17,7 @@ import torch.nn as nn
 
 # Re-export for backward compatibility with earlier code.
 from .encoders import HashedNgramEncoder, TransformerEncoder, make_encoder  # noqa: F401
+from .heads import DEFAULT_HEAD, head_out_dim, make_head
 
 
 class DistMultScorer(nn.Module):
@@ -32,6 +33,7 @@ class DistMultScorer(nn.Module):
         proj_dim: Optional[int] = None,
         normalize: bool = True,
         head_dropout: float = 0.0,
+        head: str = DEFAULT_HEAD,
     ):
         super().__init__()
         self.encoder = encoder
@@ -45,12 +47,13 @@ class DistMultScorer(nn.Module):
             nn.Dropout(self.head_dropout) if self.head_dropout > 0 else nn.Identity()
         )
         in_dim = int(getattr(encoder, "embedding_dim"))
-        if proj_dim is None or proj_dim == in_dim:
-            self.proj: nn.Module = nn.Identity()
-            self.dim = in_dim
-        else:
-            self.proj = nn.Linear(in_dim, proj_dim)
-            self.dim = proj_dim
+        self.head = head
+        # `auto` reproduces the original behaviour (Identity when the width
+        # already matches, Linear otherwise); see kgfm/heads.py.
+        self.proj: nn.Module = make_head(
+            head, in_dim, proj_dim, dropout=self.head_dropout
+        )
+        self.dim = head_out_dim(head, in_dim, proj_dim)
 
     def head_parameters(self):
         """Everything that is not the encoder — the projection head.

@@ -192,6 +192,104 @@ print((h * r * t).sum(-1))   # 行ごとのスコア
 
 ---
 
+## エンコーダとヘッド
+
+三つ組は文字列のまま**テキストエンコーダ**に入り、その出力を**ヘッド**が
+スコア次元に射影して DistMult のスコアになります。この 2 つは別々に
+差し替えられます。
+
+### エンコーダ (`--encoder`)
+
+`ngram`（学習可能な文字 n-gram ハッシュ）、`transformer`
+（`--transformer-model` で任意の HuggingFace モデル）、または**プリセット名**を
+指定します（`kgfm/encoders.py:ENCODER_PRESETS`）。
+
+| プリセット | モデル | 次元 | 備考 |
+|---|---|---|---|
+| `bert-multilingual` | `bert-base-multilingual-cased` | 768 | 従来の既定 |
+| `mpnet` | `sentence-transformers/all-mpnet-base-v2` | 768 | |
+| `bge-large` | `BAAI/bge-large-en-v1.5` | 1024 | 検索特化 335M |
+| `e5-large` | `intfloat/e5-large-v2` | 1024 | 別系統の事前学習 |
+| `gte-large` | `thenlper/gte-large` | 1024 | |
+| `xlm-roberta-large` | `xlm-roberta-large` | 1024 | 多言語 |
+| `e5-mistral-7b` | `intfloat/e5-mistral-7b-instruct` | 4096 | **frozen 専用**・bf16 |
+
+プリセットは**すべてこの環境でロードと forward を確認済み**です。
+
+- **7B 級は `frozen_only`** です。`encode_triple` は 1 step で 3B 本の系列を
+  エンコーダに通すため、実用的なバッチサイズでの fine-tune は 1 GPU に載りません。
+  sweep 側もこれらの `freeze=off` セルを自動的に生成しません。重みは更新されない
+  ので bf16 でロードし、fp32 の 28 GB を半分にしています。
+- bf16 でロードしたエンコーダは出力を fp32 に戻します。ヘッドとスコアラは
+  fp32 で、**評価は autocast の外で走る**ため、これをやらないと最初の評価で
+  `mat1 and mat2 must have the same dtype` になります。
+- `trust_remote_code` が必要なモデルはプリセット側で明示します（自動では
+  有効化しません）。
+- **2 つは試して落としました**（常にクラッシュするプリセットを置くより
+  除外する方がよいため）:
+  `microsoft/deberta-v3-large` は現行 `transformers` で tokenizer を
+  fast/slow どちらでも構築できず、`Alibaba-NLP/gte-Qwen2-7B-instruct` は
+  同梱の `modeling_qwen.py` が `DynamicCache` から削除された
+  `get_usable_length()` を呼びます。どちらもバージョン非互換です。
+
+### ヘッド (`--head`)
+
+| `--head` | 中身 | frozen 時の学習パラメータ |
+|---|---|---|
+| `auto` **(既定)** | 幅が一致すれば `Identity`、違えば `Linear` | 幅が一致すると **0** |
+| `identity` | 射影しない | 0 |
+| `linear` | `Linear(in, out)` | あり |
+| `mlp` | `Linear → GELU → Dropout → Linear` | あり |
+| `residual_mlp` | `LayerNorm → MLP` を残差接続してから射影 | あり |
+
+- **`auto` は従来の挙動そのもの**です。既存の結果はすべてこれで再現できます。
+  ただし frozen エンコーダ + 幅一致だと**学習パラメータが 0** になるので、
+  凍結して比較するときは `linear` 以降を明示してください。
+- 中間幅は**入力側**に合わせています。射影は普通は圧縮（1024 → 256）なので、
+  狭い側に合わせると非線形性を通す前に情報を捨ててしまうためです。
+- `--head-dropout` はエンコーダ出力の直後と MLP 系の内部の両方に効きます。
+
+### ベンチマークでの比較
+
+`encoders × heads × freezes` が sweep の軸です。`heads` が 2 つ以上のときだけ
+セルのタグに `_<head>` が入るので、従来の単一ヘッド設定のタグは変わりません。
+
+```bash
+bash benchmarks/run_chembl_xlarge_compare.sh              # 28 セルの比較
+bash benchmarks/run_chembl_xlarge_compare.sh --heads linear   # 軸を絞る
+bash benchmarks/run_chembl_xlarge_compare.sh --freezes on      # frozen のみ
+```
+
+`benchmarks/config_xlarge_compare.yaml` は**確認済みプリセット全 8 種**
+（ngram + 7 プリセット）× `heads: [linear, mlp]` × `freezes: [off, on]` で
+**28 セル**です。両方の freeze が可能なものはすべて両方を実行し、不可能な
+組み合わせ（ngram の frozen、7B の fine-tune）は `cell_specs()` が自動的に
+落とします。
+
+比較の公平性のため `benchmarks/config_xlarge_compare.yaml` は
+**全セルで `batch_size: 512` と `proj_dim: 256` を固定**しています。B-1 は
+負例数そのものであり、`proj_dim` はスコアを計算する次元なので、これらが
+セルごとに違うとアーキテクチャの差と交絡します。5 種すべてが H200 1 枚の
+B=512 で動くことは実測済みです（下表）。
+
+| エンコーダ (B=256, fine-tune) | ex/s |
+|---|---|
+| `ngram` | ~17,000 |
+| `bge-large` | 615 |
+| `e5-large` | 614 |
+| `gte-large` | 610 |
+| `xlm-roberta-large` | 842 |
+
+**バッチサイズ 256 は「一番重いセルが通る最大値」**です。`bge-large` の
+fine-tune は **B=512 でも B=384 でも OOM** します（143 GiB の H200、実際の
+`kgfm bench cell` をアイドル GPU で走らせて確認。512 は最初の forward で
+約 136 GiB を要求、384 は 142,957 MiB でピーク）。B=256 は 1024 次元の 4 種
+すべてで filtered プロトコル込みの通し確認済みです。
+
+28 セル × 6000 step で学習が約 15 時間、評価が約 3 時間の見込みです。
+
+---
+
 ## 学習目的関数（損失）
 
 `--loss` で切り替えます（実装は `kgfm/losses.py`）。既定は `contrastive` です。
@@ -391,6 +489,68 @@ kgfm bench run --config large --encoder-weight-decay 0.01 --head-dropout 0.1
   （bert-base-multilingual-cased + `--proj-dim 256` の場合）
 - frozen エンコーダでは学習されるのが head だけなので、
   `--head-weight-decay` / `--head-dropout` のみが効きます（`--proj-dim` 必須）。
+
+---
+
+## 学習済みモデルの公開 (`kgfm hf`)
+
+学習済みチェックポイントを HuggingFace Hub に公開します。
+
+```bash
+pip install -e ".[hf]"
+
+# ベンチマーク実行からセルを指定して
+kgfm hf --out-dir latest --tag bge-large_linear_frozen --repo you/kgfm-bge
+
+# 任意のチェックポイントを直接
+kgfm hf --ckpt checkpoints/ngram/best.pt --repo you/kgfm-ngram
+
+# 何がアップロードされるかだけ確認（ネットワークに触りません）
+kgfm hf --out-dir latest --tag ngram_linear --repo you/x --dry-run --dry-run-dir /tmp/stage
+```
+
+アップロードされるのは 3 ファイルです。`kgfm_model.pt`（ペイロード）、
+`kgfm_config.json`（`TrainConfig` と評価指標、`.pt` を開かずに中身が分かる）、
+`README.md`（モデルカード。アーキテクチャ表・実行済みなら指標表・使い方）。
+実行ディレクトリから指定した場合は `kgfm_<protocol>_<tag>.json` の指標が
+自動でカードに入ります。
+
+**サイズを 2 段階で削ります。**
+
+| | 削るもの | 実測 |
+|---|---|---|
+| 既定 | optimizer state（推論に不要、モデルの約 2 倍） | ngram 3.1 GB → **1.0 GB** |
+| `--mode head-only` | 凍結エンコーダの重み | bge-large 1.2 GB → **1.0 MB** |
+| 同上 | 同上（7B） | e5-mistral-7b 13.2 GB → **68 MB** |
+
+`freeze_encoder=True` はエンコーダのパラメータが全学習中 `requires_grad=False`
+だったことを意味するので、その重みは公開モデルとビット単位で同一です。
+再アップロードは他人のリリースの GB 単位のコピーにすぎず、**head だけが
+学習された成果物**です。`kgfm.hf.load` がプリセットからエンコーダを再構築して
+head を載せ直します。等価性は確認済みで、元のチェックポイントと再構築後の
+スコアは**ビット単位で一致**します（head-only / full 両方）。
+
+`--mode` の既定は `auto`（無損失なときだけ head-only）。fine-tune 済み
+エンコーダや ngram（スクラッチ学習なので公開コピーが無い）に `head-only` を
+指定すると、理由付きで拒否します。
+
+```python
+from kgfm.hf import load
+scorer = load("you/kgfm-bge")        # head-only ならエンコーダを自動取得
+h, r, t = scorer.encode_triple(["aspirin"], ["treats"], ["headache"])
+score = scorer.score(h, r, t)
+```
+
+- **リポジトリは既定で private** です。公開は後戻りしにくいので `--public` を
+  明示したときだけ公開になります。
+- トークンは `--token` → `$HF_TOKEN` → `$HUGGINGFACE_HUB_TOKEN` →
+  キャッシュ済みログインの順に解決します。
+- `--which best|final|last` でスナップショットを選べます（既定 `best`）。
+- `--with-optimizer` で optimizer state を残せます（Hub から学習を再開したい
+  場合のみ）。
+- head-only のペイロードは `kgfm eval --ckpt` では読めません（strict な
+  state_dict ロードで、エンコーダのテンソルを意図的に含まないため）。
+  モデルカードにもその旨が出ます。full なら `kgfm eval --ckpt` で直接使えます。
 
 ---
 

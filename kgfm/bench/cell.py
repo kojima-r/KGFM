@@ -25,6 +25,8 @@ import torch
 from ..data import read_file_list
 from ..encoders import make_encoder
 from ..eval import evaluate
+from ..encoders import ENCODER_PRESETS
+from ..heads import DEFAULT_HEAD, HEADS
 from ..model import DistMultScorer
 from ..losses import DEFAULT_LOSS, DEFAULT_TEMPERATURE, LOSSES
 from ..train import TrainConfig, train as kgfm_train
@@ -51,6 +53,7 @@ def _build_config(args: argparse.Namespace) -> TrainConfig:
         encoder=args.encoder,
         embedding_dim=args.embedding_dim,
         proj_dim=args.proj_dim,
+        head=args.head,
         transformer_model=args.transformer_model,
         freeze_encoder=args.freeze_encoder,
         batch_size=args.batch_size,
@@ -58,6 +61,7 @@ def _build_config(args: argparse.Namespace) -> TrainConfig:
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_workers=args.num_workers,
+        max_rows_per_file=args.max_rows_per_file,
         max_steps=args.max_steps,
         log_every=args.log_every,
         eval_every=args.eval_every,
@@ -115,6 +119,7 @@ def _final_eval(ckpt_path: str, args: argparse.Namespace) -> dict:
     scorer = DistMultScorer(
         encoder, proj_dim=cfg.get("proj_dim", args.proj_dim), normalize=True,
         head_dropout=cfg.get("head_dropout", 0.0),
+        head=cfg.get("head", DEFAULT_HEAD),
     ).to(device)
     scorer.load_state_dict(ckpt["model_state"])
 
@@ -164,11 +169,15 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--valid-list", default="list_chembl/valid.txt")
     p.add_argument("--test-list", default="list_chembl/test.txt")
     p.add_argument("--encoder", default="ngram",
-                   choices=["ngram", "transformer", "bert", "hf"])
+                   choices=["ngram", "transformer", "bert", "hf"]
+                           + sorted(ENCODER_PRESETS),
+                   help="'ngram', 'transformer' (+ --transformer-model), or a "
+                        "named preset from kgfm/encoders.py.")
     p.add_argument("--transformer-model", default="bert-base-multilingual-cased")
     p.add_argument("--freeze-encoder", action="store_true")
     p.add_argument("--embedding-dim", type=int, default=256)
     p.add_argument("--proj-dim", type=int, default=None)
+    p.add_argument("--head", default=DEFAULT_HEAD, choices=list(HEADS))
     p.add_argument("--batch-size", type=int, default=256,
                    help="Per-device micro-batch size.")
     p.add_argument("--per-device-train-batch-size", type=int, default=None,
@@ -185,6 +194,7 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
                    help="Learning rate; default is chosen per encoder.")
     p.add_argument("--loss", default=DEFAULT_LOSS, choices=list(LOSSES))
     p.add_argument("--loss-temperature", type=float, default=DEFAULT_TEMPERATURE)
+    p.add_argument("--max-rows-per-file", type=int, default=None)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--encoder-weight-decay", type=float, default=None)
     p.add_argument("--head-weight-decay", type=float, default=None)
@@ -249,6 +259,7 @@ def run_from_args(args: argparse.Namespace) -> Optional[dict]:
     record = {
         "method": "kgfm",
         "encoder": args.encoder,
+        "head": args.head,
         "freeze_encoder": bool(args.freeze_encoder),
         "proj_dim": args.proj_dim,
         "batch_size": args.batch_size,
