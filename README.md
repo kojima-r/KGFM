@@ -163,22 +163,26 @@ print((h * r * t).sum(-1))   # 行ごとのスコア
 ├── kgfm/                # Python パッケージ本体
 │   ├── __init__.py      # 公開 API の re-export
 │   ├── data.py          # ストリーミング TSV パイプライン
-│   ├── encoders.py      # HashedNgram / Transformer エンコーダ
+│   ├── encoders.py      # HashedNgram / Transformer エンコーダ + ENCODER_PRESETS
+│   ├── heads.py         # 射影ヘッドのレジストリ (auto / identity / linear / mlp / residual_mlp)
 │   ├── model.py         # DistMultScorer
 │   ├── losses.py        # 学習目的関数 (contrastive / softmax_ce / bce / ...)
 │   ├── eval.py          # MRR / Hit@k / nDCG (kgfm eval)
 │   ├── train.py         # 学習ループ (kgfm train)
-│   ├── cli.py           # `kgfm` コマンド (train / eval / bench / report)
+│   ├── cli.py           # `kgfm` コマンド (train / eval / bench / report / viz / hf / scaling)
 │   ├── report.py        # 実行結果の集計 (kgfm report)
 │   ├── report_html.py   # report.html (比較表 + 学習曲線) の生成
 │   ├── charts.py        # グラフ描画 (plotly / matplotlib / 内蔵 SVG)
 │   ├── viz.py           # 埋め込みの 2 次元射影 (kgfm viz)
+│   ├── hf.py            # HuggingFace Hub への公開 (kgfm hf)
 │   ├── runs.py          # 実行ディレクトリと tee ログ
-│   ├── envs.py          # conda env 解決
+│   ├── envs.py          # conda env 解決 (子プロセスの python を明示的に決める)
 │   ├── utils.py         # GPU セレクタ、ファイルハッシュバケット
 │   ├── bench/           # kgfm 自身のベンチマーク (kgfm bench ...)
+│   ├── scaling/         # スケーリング則の集計 (kgfm scaling)
 │   └── baselines/       # ULTRA / MOTIF (kgfm-ultra / kgfm-motif)
-├── benchmarks/          # ベンチマーク用の薄いシェルラッパ (詳細は benchmarks/README.md)
+├── benchmarks/          # 手法比較のシェルラッパ + config_*.yaml (詳細は benchmarks/README.md)
+├── benchmark_scaling/   # スケーリング則の実験 (詳細は benchmark_scaling/README.md)
 ├── list_small/          # スモークラン用の小さなファイルリスト
 ├── list_large/          # フルスケールのファイルリスト
 ├── list_chembl/         # ChEMBL 専用ベンチマークリスト
@@ -210,8 +214,10 @@ print((h * r * t).sum(-1))   # 行ごとのスコア
 | `bert-mini` | `prajjwal1/bert-mini` | 256 | 11.2M |
 | `bert-small` | `prajjwal1/bert-small` | 512 | 28.8M |
 | `bert-medium` | `prajjwal1/bert-medium` | 512 | 41.4M |
-| `scratch-tiny` … `scratch-base` | 上記 + `bert-base-uncased` | 128–768 | **ランダム初期化**（4.4M–109.5M） |
-| `bert-multilingual` | `bert-base-multilingual-cased` | 768 | 従来の既定 |
+| `scratch-tiny` … `scratch-base` | 上記 4 つ + `bert-base-uncased` の config | 128–768 | **ランダム初期化** 4.4M / 11.2M / 28.8M / 41.4M / 109.5M |
+| `scratch-xl` | `bert-large-uncased` を 16 層に縮めた config | 1024 | ランダム初期化 234.6M |
+| `scratch-large` | `bert-large-uncased`（24 層） | 1024 | ランダム初期化 335.4M。H200 1 枚で回せるサイズ軸の上端 |
+| `bert-multilingual` | `bert-base-multilingual-cased` | 768 | `--encoder transformer` で `--transformer-model` を省略したときに読まれるモデル（`kgfm/train.py` の argparse 既定値）。プリセット機構を入れる前の実験はすべてこれで、比較用に残しています |
 | `mpnet` | `sentence-transformers/all-mpnet-base-v2` | 768 | |
 | `bge-large` | `BAAI/bge-large-en-v1.5` | 1024 | 検索特化 335M |
 | `e5-large` | `intfloat/e5-large-v2` | 1024 | 別系統の事前学習 |
@@ -259,17 +265,25 @@ print((h * r * t).sum(-1))   # 行ごとのスコア
 | `mlp` | `Linear → GELU → Dropout → Linear` | あり |
 | `residual_mlp` | `LayerNorm → MLP` を残差接続してから射影 | あり |
 
-- **`auto` は従来の挙動そのもの**です。既存の結果はすべてこれで再現できます。
-  ただし frozen エンコーダ + 幅一致だと**学習パラメータが 0** になるので、
-  凍結して比較するときは `linear` 以降を明示してください。
+- **`auto` はヘッドが選択肢になる前の挙動そのもの**です（幅が一致すれば
+  `nn.Identity`、違えば `nn.Linear`）。`heads` 軸を持たない config
+  （`config_small` / `_middle` / `_large` / `_xlarge`、および
+  `benchmark_scaling/` の各 config）はこの経路を通るため、既定を
+  `linear` ではなく `auto` にしてあります。ただし frozen エンコーダ +
+  幅一致だと**学習パラメータが 0** になるので（`proj` が `Identity` に
+  縮退し、エンコーダ側は `requires_grad=False`）、凍結して比較するときは
+  `linear` 以降を明示してください。
 - 中間幅は**入力側**に合わせています。射影は普通は圧縮（1024 → 256）なので、
   狭い側に合わせると非線形性を通す前に情報を捨ててしまうためです。
 - `--head-dropout` はエンコーダ出力の直後と MLP 系の内部の両方に効きます。
 
 ### ベンチマークでの比較
 
-`encoders × heads × freezes` が sweep の軸です。`heads` が 2 つ以上のときだけ
-セルのタグに `_<head>` が入るので、従来の単一ヘッド設定のタグは変わりません。
+`encoders × heads × freezes` が sweep の軸です。セルのタグは
+`<encoder>[_<head>][_frozen]` で、**`_<head>` の部分は `heads` を 2 つ以上
+振ったときだけ**入ります。つまり `heads` を振らない config
+（`config_large.yaml` など）のタグは `ngram` / `transformer_frozen` の形の
+まま変わらず、結果 JSON のファイル名も変わりません。
 
 ```bash
 bash benchmarks/run_chembl_xlarge_compare.sh              # 28 セルの比較
@@ -283,11 +297,49 @@ bash benchmarks/run_chembl_xlarge_compare.sh --freezes on      # frozen のみ
 組み合わせ（ngram の frozen、7B の fine-tune）は `cell_specs()` が自動的に
 落とします。
 
+この 28 セルは実際に完走しており、結果は
+`benchmarks/results/chembl/20260811T230140Z_chembl_xlarge_compare/table.md`
+にあります（全 28 行 × 2 プロトコル）。filtered MRR の上位・下位はこうなりました。
+
+| 順位 | セル | filtered MRR |
+|---|---|---|
+| 1 | `gte-large` + `mlp` + fine-tune | **0.4641** |
+| 2 | `bert-multilingual` + `linear` + fine-tune | 0.4538 |
+| 3 | `bert-multilingual` + `mlp` + fine-tune | 0.4413 |
+| 4 | `e5-large` + `mlp` + fine-tune | 0.4364 |
+| 5 | `ngram` + `linear` + fine-tune | 0.4331 |
+| … | | |
+| 27 | `e5-mistral-7b` + `linear` + frozen | 0.3247 |
+| 28 | `ngram` + `mlp` + fine-tune | 0.2539 |
+
+読み方の要点が 3 つあります。**(1) ヘッドはエンコーダごとに向きが違います**
+— `gte-large` は `mlp` で最良、`ngram` は `mlp` で最下位（0.4331 → 0.2539）
+なので、「どのヘッドが良いか」は単独では決まりません。**(2) エンコーダを
+大きくしても効いていません** — 7B (`e5-mistral-7b`) は frozen 専用なので
+frozen 同士で比べると 0.3247 / 0.4079 で、178M の `bert-multilingual`
+frozen (0.4018 / 0.4267) と同等以下です。**(3) 文字 n-gram は十分強い
+ベースラインです** — `ngram` + `linear` が 28 セル中 5 位で、1024 次元の
+検索特化エンコーダのほとんどより上です。`config_xxlarge.yaml` の既定が
+`gte-large` + `mlp` なのはこの表が根拠です。
+
 比較の公平性のため `benchmarks/config_xlarge_compare.yaml` は
-**全セルで `batch_size: 512` と `proj_dim: 256` を固定**しています。B-1 は
+**全セルで `batch_size: 256` と `proj_dim: 256` を固定**しています。B-1 は
 負例数そのものであり、`proj_dim` はスコアを計算する次元なので、これらが
-セルごとに違うとアーキテクチャの差と交絡します。5 種すべてが H200 1 枚の
-B=512 で動くことは実測済みです（下表）。
+セルごとに違うとアーキテクチャの差と交絡します。
+
+**バッチサイズ 256 は選択ではなく「一番重いセルが通る最大値」**です。
+`bge-large` + `mlp` の fine-tune は **B=512 でも B=384 でも OOM** します
+（143 GiB の H200 で、推定ではなく実際の `kgfm bench cell` をアイドル GPU で
+走らせて確認。512 は最初の学習 forward で約 136 GiB を要求して落ち、384 は
+142,957 MiB / 143,771 MiB でピークに達して落ちる）。B=256 は 1024 次元の
+4 プリセット（bge / e5 / gte / xlm-r）すべてで filtered プロトコル込みの
+通し確認済みです。なお **`nvidia-smi` の数字ではセルのサイズは決められません**
+— PyTorch のキャッシュアロケータはカードを埋めるまで確保を伸ばすので、
+問題なく回っている B=256 でも 137 GiB 使用と表示されます。判定は実コマンドの
+成否です。
+
+実測スループット（B=256、fine-tune、`kgfm bench cell` を 12 step ＝ warmup
+込みで回した値なので下振れ寄り）:
 
 | エンコーダ (B=256, fine-tune) | ex/s |
 |---|---|
@@ -297,13 +349,10 @@ B=512 で動くことは実測済みです（下表）。
 | `gte-large` | 610 |
 | `xlm-roberta-large` | 842 |
 
-**バッチサイズ 256 は「一番重いセルが通る最大値」**です。`bge-large` の
-fine-tune は **B=512 でも B=384 でも OOM** します（143 GiB の H200、実際の
-`kgfm bench cell` をアイドル GPU で走らせて確認。512 は最初の forward で
-約 136 GiB を要求、384 は 142,957 MiB でピーク）。B=256 は 1024 次元の 4 種
-すべてで filtered プロトコル込みの通し確認済みです。
-
-28 セル × 6000 step で学習が約 15 時間、評価が約 3 時間の見込みです。
+frozen セルは LM への backward が無いので、fine-tune セルのおよそ 1.5 倍
+速くなります。28 セル × 6000 step で学習が約 15 時間、評価が約 3 時間
+（56 パス。filtered は 1 パスごとに 46 万件の tail 語彙をエンコードします）
+の見込みで、1 日を見ておけば足ります。
 
 ---
 
@@ -386,7 +435,10 @@ L = -(1/B) Σ_i  log [ exp(S̃_ii) / Σ_j exp(S̃_ij) ]
 
 ### `softmax_ce` — 生スコアの softmax 交差エントロピー
 
-`contrastive` から正規化と温度を除いたもの。本モジュール導入以前の挙動です。
+`contrastive` から正規化と温度を除いたもの。`kgfm/losses.py`（`--loss` の
+切り替え機構）が入る前は損失がこれ 1 つしかなく、**それ以前に取った結果は
+すべてこの目的関数で学習されたもの**です。`benchmarks/results/` にある
+2026-08-09 以前の run が該当します。
 
 ```
 L = -(1/B) Σ_i  log [ exp(S_ii) / Σ_j exp(S_ij) ]
@@ -468,8 +520,9 @@ ln(512)=6.24 を明確に下回るため損失が解釈可能なまま保たれ�
 > `--margin` をそのスケールに合わせて調整する必要があります。既定値のまま
 > 差し替えても妥当な学習にはなりません。
 >
-> 既定を変更したため、`softmax_ce` 時代の結果とは直接比較できません。
-> 従来挙動は `--loss softmax_ce` で再現できます。
+> **既定が `softmax_ce` から `contrastive` に変わっているので、損失の値は
+> 世代をまたいで比較できません**（順位指標 MRR / Hit@k は行ごとの単調変換に
+> 不変なので比較できます）。`--loss softmax_ce` を渡せば旧既定を再現できます。
 
 ---
 
@@ -551,26 +604,34 @@ steps = ceil(max_epoch × epoch_examples / (batch_size × nproc × grad_accum))
 ### ファイルはインターリーブして読む
 
 ChEMBL の TSV は activity ID で分割されているため、**1 ファイル = 1 つの
-エンティティ集団**です。以前は各ファイルを最後まで読んでから次に移っていました
-が、1 ファイルが 1000 万行あるので**どのファイルも読み終わりません** — 25k step
-/ B=512 の run が worker あたり 320 万行しか引かないので、85 ファイル中 4 つの
-先頭 32% しか見ないことになります。学習ストリームは 1 つの分布ではなく
-「分布の列」で、勾配は常に直近のファイルの偏りを追いかけていました。
+エンティティ集団**です。`StreamingTripleDataset` は既定で
+`interleave_chunk`（64）行ずつ**全 train ファイルをラウンドロビンに**読みます
+(`interleave_files=True`)。
 
-現在は既定で `interleave_chunk`（64）行ずつラウンドロビンに読みます
-(`interleave_files=True`)。**行の多重集合は完全に同一**で、順序だけが変わります。
-効果は集団の混合で、先頭 2000 行の平均 tail 長は連結読みで 26.6（1 ファイル目
-そのものの値）、インターリーブで 39.7（2 ファイルの中間）でした。
+これは 2026-08-25 に既定を変えた箇所です。それ以前は各ファイルを最後まで
+読んでから次に移る実装でしたが、1 ファイルが 1000 万行あるので**どのファイルも
+読み終わりません** — 25k step / B=512 の run が worker あたり 320 万行しか
+引かないので、85 ファイル中 4 つの先頭 32% しか見ないことになります。学習
+ストリームは 1 つの分布ではなく「分布の列」で、勾配は常に直近のファイルの
+偏りを追いかけていました。
 
-以前の挙動が必要な場合だけ `--no-interleave-files` を渡してください。
+ラウンドロビンでも**行の多重集合は完全に同一**で、順序だけが変わります
+（2 ファイル各 500 行で多重集合が一致することを検証済み）。効果は集団の
+混合で、先頭 2000 行の平均 tail 長は連結読みで 26.6（1 ファイル目そのものの
+値）、インターリーブで 39.7（2 ファイルの中間）でした。
+
+**`--no-interleave-files` は 2026-08-25 より前の run を再現するためだけの
+フラグ**です。新しく実験するときに渡す理由はありません。
 validation loss も既定でシャッフルしたストリーム上で測ります
 （`--no-valid-loss-shuffle` で無効化）— シャッフルしないと in-batch 負例が
 「たまたま隣にいた行」になってしまうためです。どちらも `kgfm train` と
 `kgfm bench cell` の両方にあり、config の `cells:` でセルごとに設定できます。
 
-なお `kgfm eval` の候補プールと filter index も同じデータセットを使うため、
-プールが 1 ファイルの先頭からではなく全ファイルから引かれるようになります。
-より代表的になりますが、**この変更以前の run の評価値とは比較できません**。
+なお `kgfm eval` の候補プールと filter index (`eval.build_candidate_pool` /
+`build_filter_index`) も同じデータセットを使うため、プールが 1 ファイルの
+先頭からではなく全ファイルから引かれるようになります。より代表的になり
+ますが、**候補プールの中身が変わるので、2026-08-25 より前に取った評価値
+（`benchmarks/results/chembl/` の 20260816 以前の run）とは比較できません**。
 
 ---
 
@@ -697,22 +758,45 @@ ls benchmarks/results/chembl/latest/
 # meta.json kgfm_<protocol>_<encoder>.json ultra.json motif.json table.md report.html run.log ...
 ```
 
-ChEMBL 上でのスモーク実測例 (50k 学習 / 2k テスト・三つ組、kgfm は 200 steps のみの簡易学習):
+**3 手法が同じ run に揃っている記録**は
+`benchmarks/results/chembl/20260808T073317Z_fulltest/table.md` です
+（`config_small.yaml` 相当: prep 50k / 2k / 2k、|E| = 72,669、
+inductive モード、kgfm は 200 step のみ）。
 
-| 手法 | モード | Protocol | MRR | Hit@1 | Hit@3 | Hit@10 |
-|---|---|---|---|---|---|---|
-| kgfm (ngram, 200 steps) | 学習 | pooled (200) | 0.111 | — | — | 0.328 |
-| kgfm (ngram, 200 steps) | 学習 | filtered (5000) | 0.037 | — | — | 0.082 |
-| ULTRA (zero-shot, CPU) | 推論のみ | filtered | 0.175 | 0.153 | 0.199 | 0.210 |
-| MOTIF (zero-shot, GPU) | 推論のみ | filtered | 0.174 | 0.147 | 0.200 | 0.210 |
+| 手法 | モード | Protocol | MRR | Hit@1 | Hit@3 | Hit@10 | n_eval |
+|---|---|---|---|---|---|---|---|
+| kgfm (ngram, 200 steps) | 学習 | pooled (5000) | 0.2632 | — | — | 0.2807 | 5120 |
+| kgfm (ngram, 200 steps) | 学習 | filtered (50000) | 0.2698 | — | — | 0.2791 | 5120 |
+| kgfm (transformer, 200 steps) | 学習 | pooled (5000) | 0.1966 | — | — | 0.3891 | 5120 |
+| kgfm (transformer, 200 steps) | 学習 | filtered (50000) | 0.2851 | — | — | 0.3639 | 5120 |
+| ULTRA (zero-shot, CPU) | 推論のみ | filtered | 0.1753 | 0.1532 | 0.1993 | 0.2100 | 2000 |
+| MOTIF (zero-shot, GPU) | 推論のみ | filtered | 0.1740 | 0.1470 | 0.2003 | 0.2100 | 2000 |
 
-> kgfm は文字 n-gram の 200 step 学習という極めて軽い条件、ULTRA / MOTIF は事前学習済みモデルでのゼロショット推論です。filtered プロトコルでは候補集合が約 25 倍に増えるため数字が大きく下がります。kgfm を ULTRA / MOTIF と直接比較するときは `--protocols filtered` を使い、学習ステップ数も同じ計算予算で揃えてください。
+> **これは「3 手法が同じディレクトリで動く」ことの確認で、kgfm の性能を
+> 示す数字ではありません。** kgfm 側は 200 step しか学習していません。
+> また `n_eval` は手法間で意味が違い（kgfm は tail 方向のみ、ULTRA / MOTIF は
+> head+tail の平均なので分母が実質 2 倍）、直接横並びにはできません。
+> 詳細は `benchmarks/README.md` の「test サンプル数 (`n_eval`) と評価指標への
+> 影響」を参照してください。
+
+**kgfm 本体の実力**は下記の 2 つの run です（どちらもベースライン行は
+含まれていません）。
+
+| run | 条件 | filtered MRR | pooled MRR |
+|---|---|---|---|
+| `20260811T230140Z_chembl_xlarge_compare` | 28 セル比較の最良（`gte-large` + `mlp`）、6,000 step | 0.4641 | 0.4929 |
+| `20260816T053252Z_chembl_xxlarge` | 同じセルで**全 674M 行を 1 エポック**（1,316,925 step） | 0.4410 | **0.5164** |
+
+filtered が下がっているのは候補語彙が 419k → 1,563,335 と 3.7 倍になって
+分母が増えたためで、データ量の効果とは分離できていません。pooled は
+両方 `pool_size: 12000` なので比較可能で、こちらは上がっています。
 
 3 手法はそれぞれ独立したコマンドです。共有しているのは実行ディレクトリだけで、各手法がそこに JSON を落とし、`kgfm report` が拾って 1 枚の表にします。`benchmarks/*.sh` は repo root に `cd` してこれらを順に呼ぶだけの数行のラッパです。
 
 ```bash
 kgfm bench run --config benchmarks/config_large.yaml   # kgfm 自身のベンチマーク
-                                                       # small/middle/large/xlarge
+                                                       # small / middle / large / xlarge /
+                                                       # xlarge_compare / xxlarge
 kgfm-ultra --out-dir latest       # 別手法・別コマンド
 kgfm-motif --out-dir latest
 kgfm viz --ckpt <ckpt>            # h/t 埋め込みを 2 次元に射影 (PCA / UMAP)
@@ -720,6 +804,27 @@ kgfm report --out-dir latest      # 集計 → table.md + report.html (--list �
 ```
 
 env は 2 つです: kgfm 自身は **`kgfm`**、ベースライン (ULTRA / MOTIF) は **`kgfm-ultra`** で動きます。後者は両者が `rspmm` CUDA 拡張を JIT ビルドする都合で torch と一致する nvcc が要るためで、`bash benchmarks/setup_baseline_env.sh` で構築します。どちらの env で動かしても指標は一致することを実測済みです。詳細とハマりどころは `benchmarks/README.md` の「conda 環境」節を参照してください。
+
+---
+
+## スケーリング則の測定 (`benchmark_scaling/`)
+
+「どの構成が一番強いか」を問う `benchmarks/` とは別に、「**計算量を増やすと
+損失はどう下がるか**」を問う実験を `benchmark_scaling/` に置いています。
+sweep 軸はモデルサイズ（`scratch-tiny` 4.4M 〜 `scratch-large` 335M）で、
+出力は比較表ではなく計算量-損失のプロットです。
+
+```bash
+bash benchmark_scaling/run_scaling_smoke.sh     # 数分の通し確認
+bash benchmark_scaling/run_lr_probe.sh          # サイズごとの学習率を測る（先にこれ）
+bash benchmark_scaling/run_scaling_scratch.sh   # 本番（ランダム初期化 7 サイズ）
+```
+
+**学習コードは `kgfm bench run` と共通**で、スケーリング専用の学習経路は
+ありません。`kgfm scaling` が既存の `cell_*.log` を (計算量, 損失) 座標に
+読み替えるだけなので、終わった run に後から適用できます。設計・実測値・
+落とし穴（学習率をサイズごとに振らないと指数が平坦化する、early stopping を
+入れてはいけない、など）は `benchmark_scaling/README.md` にまとめてあります。
 
 ---
 

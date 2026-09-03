@@ -126,9 +126,11 @@ kgfm report --out-dir latest
 
 | スクリプト | 中身 |
 |---|---|
-| `run_chembl.sh` / `_middle.sh` / `_large.sh` / `_xlarge.sh` | 上記を `--config benchmarks/config_*.yaml` で |
+| `run_chembl.sh` / `_middle.sh` / `_large.sh` / `_xlarge.sh` | 上記を `--config benchmarks/config_*.yaml` で（`run_chembl.sh` は `config_small.yaml`） |
+| `run_chembl_xlarge_compare.sh` | `config_xlarge_compare.yaml`（28 セルのアーキテクチャ比較） |
+| `run_chembl_xxlarge.sh` | `config_xxlarge.yaml`（全 674M 行を 1 エポック） |
 | `run_chembl_large_2gpu.sh` / `_xlarge_2gpu.sh` | 同じ config に `--nproc 2` を足すだけ |
-| `resume_chembl.sh` | 同上 + `--resume <target>` |
+| `resume_chembl.sh [target]` | `config_xlarge.yaml` + `--resume <target>`（既定 `latest`）。**config は中断した run と一致させる必要があるので、xlarge 以外を再開するときは `--config` を渡してください** |
 | `setup_baselines.sh` | `kgfm-ultra --setup` と `kgfm-motif --setup` |
 | `setup_baseline_env.sh` | ベースライン用 conda env (`kgfm-ultra`) を構築 |
 
@@ -187,14 +189,33 @@ kgfm bench run --config large            # benchmarks/config_large.yaml に解�
 kgfm bench configs                       # 同梱の設定ファイル一覧と中身
 ```
 
-| ファイル | 用途 | 実測ベースの見積 (H200 x1) |
-|---|---|---|
-| `config_small.yaml` | スモークテスト | 約 0.5 時間 |
-| `config_middle.yaml` | 中規模 | 約 4.3 時間（6 時間枠） |
-| `config_large.yaml` | 論文掲載レベル | 約 10.8 時間（12 時間枠） |
-| `config_xlarge.yaml` | 論文掲載レベル・最大 | 約 21.4 時間（24 時間枠） |
-| `config_xlarge_compare.yaml` | アーキテクチャ比較（28 セル） | 約 19 時間（学習 15.9h + 評価 3h） |
-| `config_xxlarge.yaml` | **全 674M 行を 1 エポック**（gte-large + mlp） | 約 10.4 日（2 GPU で 5.2 日） |
+| ファイル | 用途 | 実測ベースの見積 (H200 x1) | 完走済みの run |
+|---|---|---|---|
+| `config_small.yaml` | スモークテスト | 約 0.5 時間 | `20260808T073317Z_fulltest`（3 手法揃い） |
+| `config_middle.yaml` | 中規模 | 約 4.3 時間（6 時間枠） | — |
+| `config_large.yaml` | 論文掲載レベル | 約 10.8 時間（12 時間枠） | `20260809T051610Z_chembl_large` |
+| `config_xlarge.yaml` | 論文掲載レベル・最大 | 約 21.4 時間（24 時間枠） | `20260808T114948Z_chembl_xlarge` |
+| `config_xlarge_compare.yaml` | アーキテクチャ比較（28 セル） | 約 19 時間（学習 15.9h + 評価 3h） | `20260811T230140Z_chembl_xlarge_compare` |
+| `config_xxlarge.yaml` | **全 674M 行を 1 エポック**（gte-large + mlp） | 約 10.4 日（2 GPU で 5.2 日） | `20260816T053252Z_chembl_xxlarge` |
+
+「完走済みの run」は `benchmarks/results/chembl/<名前>/` です。それぞれ
+`table.md`（結果）・`meta.json`（実行条件）・`commands.jsonl`（実行した
+コマンド列）・`cell_*.log`（学習ログ）が揃っているので、数字の出どころは
+ここから追えます。`kgfm report --list` でも一覧できます。
+**世代をまたぐ比較には 2 つ注意があります**（どの run がどちらかは
+`meta.json` の `git_rev` で判別できます）。
+
+- **損失関数の既定**: `kgfm/losses.py` が入ったのはコミット `3e23a11`
+  (2026-08-09) です。それ以前の `git_rev` を持つ run
+  （`_fulltest` / `_chembl_xlarge` / `_chembl_large` = いずれも `0fabff5`）は
+  唯一の目的関数だった **`softmax_ce`** で学習されており、`_xlarge_compare`
+  以降は **`contrastive`** です。損失の絶対値はまたいで比較できません
+  （MRR / Hit@k は行ごとの単調変換に不変なので比較できます）。
+- **データ読み出し順**: ファイルのラウンドロビン読み (`interleave_files`)
+  を既定にしたのは 2026-08-25 で、**上表のどの run よりも後**です。つまり
+  既存の結果はすべて「1 ファイルを読み切ってから次へ」の順序で学習され、
+  評価の候補プールも先頭ファイル寄りに偏っています。今から回す run とは
+  評価値を直接比較できません。
 
 ```bash
 bash benchmarks/run_chembl.sh          # small
@@ -306,19 +327,50 @@ steps = ceil(max_epoch × epoch_examples / (batch_size × nproc × grad_accum))
 既定の `gte-large` は 10.4 日、`ngram` なら 11 時間です。どちらを選ぶかは
 「性能優先か時間優先か」で、既定は**性能優先**にしてあります。
 
-なお 25k step の large 実行では fine-tune した transformer が過学習しました
-（train loss は下がり続けるのに valid loss が step 12.5k で底を打って上昇）。
-あれは行の反復による暗記ではありません（0.05 エポック未満なので同じ行は
-二度と現れない）— 到達できた数ファイルへの適合、つまり母集団シフトでした。
-全エポックは 85 ファイルすべてに到達するので、**この失敗モードに対する
-回避策ではなく直接的な対処**になります。
+なお 25k step の large 実行
+（`benchmarks/results/chembl/20260809T051610Z_chembl_large/`）では fine-tune
+した transformer が過学習しました（train loss は下がり続けるのに valid loss が
+step 12.5k で底を打って上昇）。これは行の反復による暗記ではありません
+（0.05 エポック未満なので同じ行は二度と現れない）— 到達できた数ファイルへの
+適合、つまり母集団シフトでした。全エポックは 85 ファイルすべてに到達するので、
+**この失敗モードに対する回避策ではなく直接的な対処**になります。
 
-> **filtered の値は他の config と比較できません。** 全コーパスの |E| は未計測で
-> （674M 行の prep が必要）、filtered プロトコルが全エンティティを埋め込むのは
-> 不可能なので、`max_filter_tails: 2000000` は |E| ではなく「評価が終わる上限」
-> です。候補が |E| より少ないぶん **楽観的な値**になります。large / xlarge は
-> `max_filter_tails ≈ |E|` なので、xxlarge の filtered はこの config 内でのみ
-> 比較してください。
+##### 実行結果（完走済み）
+
+`benchmarks/results/chembl/20260816T053252Z_chembl_xxlarge/` が、この config を
+`--nproc 2` で**実際に 1 エポック完走させた**記録です。
+
+| | 値 |
+|---|---|
+| セル | `gte-large` + `mlp` + fine-tune、B=256 |
+| step 数 | 1,316,925（= `max_epoch: 1.0` を 2 GPU で解決した値。337M examples/rank） |
+| スループット | 785 ex/s（最終付近の実測） |
+| in-loop valid MRR (pooled) | 0.7772 @ step 1,316,920 |
+| **最終 test MRR (pooled, 12k)** | **0.5164** (Hit@1 0.4982 / Hit@10 0.5508 / nDCG 0.5734) |
+| **最終 test MRR (filtered)** | **0.4410** (Hit@1 0.4173 / Hit@10 0.4869 / nDCG 0.4906) |
+
+**同じセルを 6,000 step だけ回した 28 セル比較では filtered MRR 0.4641** です。
+つまり 220 倍のデータを入れても filtered の数字は上がっていません（0.4641 →
+0.4410）。ただし**この 2 つは直接比較できません** — 28 セル比較は
+`max_filter_tails: 460000`（≈ その prep の \|E\| = 419,252）、xxlarge は
+2,000,000（実際に構築された語彙 1,563,335）で、候補語彙の大きさが 3.7 倍
+違います。分母が増えれば MRR は下がるので、この差の内訳は不明です。
+**同じ語彙で比べたいなら `kgfm eval` で再スコアしてください**（その際は
+`--filter-list` を train / valid / test の 3 つとも渡すこと。後述の
+「filtered の落とし穴 2 つ」参照）。
+pooled 側は両方 `pool_size: 12000` なので比較可能で、0.4929 → 0.5164 と
+上がっています。
+
+> **filtered の値は他の config と比較できません。** 全コーパスの |E| は未計測です
+> （知るには 674M 行の prep が必要で、それを filtered プロトコルで全部
+> 埋め込むのはそもそも不可能）。したがって `max_filter_tails: 2000000` は
+> |E| ではなく単に「評価が現実的な時間で終わる上限」です。実際に構築された
+> 語彙は 1,563,335 件でこの上限に届いていません — 効いていたのは
+> `max_filter_rows: 10000000` の方で、`filter_pairs` が 9,213,329 なので
+> ちょうど 1000 万行を読んだところで打ち切られています。真の |E| より
+> 候補が少ないぶん **楽観的な値**になります。large / xlarge は
+> `max_filter_tails ≈ |E|` に合わせてあるので、xxlarge の filtered は
+> この config 内でのみ比較してください。
 
 #### アーキテクチャ比較
 
@@ -335,10 +387,21 @@ bash benchmarks/run_chembl_xlarge_compare.sh
 bash benchmarks/run_chembl_xlarge_compare.sh --encoders ngram,bge-large --heads linear
 ```
 
-全セルで `batch_size: 512` と `proj_dim: 256` を固定しています。B-1 は負例数
-そのもの、`proj_dim` はスコア計算の次元なので、セルごとに変えると
-アーキテクチャの差と交絡するためです。`e5-mistral-7b` は 14 GB の初回
-ダウンロードが発生します。
+全セルで **`batch_size: 256`** と `proj_dim: 256` を固定しています。B-1 は
+負例数そのもの、`proj_dim` はスコア計算の次元なので、セルごとに変えると
+アーキテクチャの差と交絡するためです。**256 は選択ではなく制約**で、一番重い
+`bge-large` + `mlp` の fine-tune が B=384 でも B=512 でも OOM するために
+決まった値です（実際の `kgfm bench cell` で確認。詳細は
+`config_xlarge_compare.yaml` 冒頭のコメント）。`e5-mistral-7b` は 14 GB の
+初回ダウンロードが発生します。
+
+**結果は
+`benchmarks/results/chembl/20260811T230140Z_chembl_xlarge_compare/table.md`
+にあります。** filtered MRR の 1 位は `gte-large` + `mlp` + fine-tune で
+0.4641、最下位は `ngram` + `mlp` の 0.2539、`ngram` + `linear` は 0.4331 で
+5 位です。`config_xxlarge.yaml` が `gte-large` + `mlp` を既定にしているのは
+この表が根拠で、ngram のベースライン行を足すときに `--heads linear` を
+明示しないといけないのも同じ理由です（`ngram` + `mlp` は 28 セル中最下位）。
 
 #### 2 GPU で動かす
 
@@ -351,10 +414,20 @@ bash benchmarks/run_chembl_large_2gpu.sh    # config_large.yaml  + --nproc 2
 bash benchmarks/run_chembl_xlarge_2gpu.sh   # config_xlarge.yaml + --nproc 2
 ```
 
-> **2026-08-16 の修正**: それ以前の `--nproc 2` 実行は **DDP の勾配同期が全く
-> 効いておらず**、2 つの独立したモデルを学習して rank 1 の結果を捨てていました
-> （`in_batch_negative_loss` が `DDP.forward` を迂回していたため）。修正済みで、
-> 以下の記述は修正後の挙動です。1 GPU の結果は影響を受けません。
+> **2026-08-16 より前の 2 GPU 実行結果は信用できません。** それ以前の
+> `--nproc 2` 実行は **DDP の勾配同期が全く効いておらず**、2 つの独立した
+> モデルを学習して rank 1 の結果を捨てていました。原因は
+> `in_batch_negative_loss` が `DistributedDataParallel` のラッパではなく
+> `.module` を呼んでいたことで、`reducer.prepare_for_backward()` を呼ぶのは
+> `DDP.forward` だけなので、**勾配の all-reduce が 1 度も起きていません**
+> でした（実測: 異なるデータを与えた 2 rank が 5 step 後に全く違う重みに
+> なる。`DDP.forward` 経由なら同じ条件でビット単位一致）。副作用として
+> rank が同期せず自由走行し、最初の eval barrier で NCCL の watchdog を
+> 超えて 9 時間の run が step 131k で落ちる、という形でも現れました。
+> 現在は `DistMultScorer.forward` に `return_embeddings=True` を通して
+> ラッパ側を呼んでいます。**1 GPU の結果は影響を受けません**（`benchmarks/
+> results/chembl/` の run のうち影響があるのは `--nproc 2` で回したものだけ
+> で、`meta.json` の `nproc` で判別できます）。以下の記述は修正後の挙動です。
 
 **負例数は GPU 台数で変わりません。** `in_batch_negative_loss` の `[B,B]`
 行列は各 rank のローカルなマイクロバッチから作られ、kgfm には埋め込みの
@@ -390,6 +463,26 @@ defaults:
   max_rows_per_file: 500000   # 1 ファイル 50 万行で次へ = 触るファイル数が約 20 倍
 ```
 
+**プロセスグループのタイムアウトは 2 時間**です（`TrainConfig.dist_timeout_min
+= 120`、NCCL の既定は 10 分）。評価とチェックポイント書き出しは rank 0 だけで
+走り、その間ほかの rank は `barrier()` で待つので、大きな tail 語彙に対する
+filtered 評価は 10 分を普通に超えます。実際に既定の 10 分だと
+`20260813T093403Z_chembl_xxlarge` が step 131k で
+`Watchdog caught collective operation timeout ... ran for 600068 milliseconds`
+を出して死にました（`cell_pooled_gte-large.log` に残っています）。**遅い評価を
+クラッシュに変えないための設定**で、性能とは無関係です。
+
+**DDP では HF モデルの `pooler` を凍結しています**（`kgfm/encoders.py`）。
+このエンコーダは `last_hidden_state` を自分で pooling するので BERT 系
+チェックポイントに付いてくる `pooler`（[CLS] に対する Linear）を一度も
+呼びません。すると勾配を受け取らないパラメータが残り、
+`find_unused_parameters=False`（既定）の DDP では 2 step 目で
+`Expected to have finished reduction in the prior iteration` になって
+**落ちます**（実例: `20260816T052044Z_chembl_xxlarge` が
+`Parameter indices which did not receive grad: 389 390` で終了）。
+`requires_grad=False` にするのが正確な対処で、`add_pooling_layer=False` と
+違って重みは state_dict に残るのでチェックポイントの互換性も保てます。
+
 **学習率は変えていません。** 実効バッチが 2 倍なら lr を上げるのが定石ですが、
 実測（ngram, 1000 step, global_bs=1024, valid loss / pooled MRR）では
 
@@ -405,9 +498,13 @@ defaults:
 （ngram 1e-3 / transformer 3e-5）である以上それ自体が不適切です。どうしても
 変えるなら `cells: <tag>: lr:` を使ってください。
 
-なお `--per-device-train-batch-size` は**渡さないでください**。これは全セル
-共通の上書きなので、`transformer_batch_size` によるエンコーダごとの
-バッチサイズの区別を潰してしまいます。
+なお `_2gpu.sh` に `--per-device-train-batch-size` は**渡さないでください**。
+`sweep.py` はセルごとに `--batch-size` を送りますが
+`--per-device-train-batch-size` は run 全体に 1 回しか送らないので、これを
+渡すと `cells: <tag>: batch_size:` で付けたセルごとの差が全部潰れます
+（`_2gpu.sh` が `--nproc 2` だけを足す薄いラッパである理由もこれです）。
+`--nproc` を変えても per-device のバッチサイズは `batch_size` のままなので、
+そもそも渡す必要がありません。
 
 ### 所要時間の内訳
 
@@ -447,11 +544,16 @@ README の「test サンプル数と評価指標への影響」節のガイド�
 - `max_filter_tails ≈ |E|` — filtered の候補語彙を切り詰めない
 - `freezes: ["off", "on"]` — フル fine-tune と凍結エンコーダの ablation
 
-**バッチサイズは全セル共通の 512** です (`transformer_batch_size` は未設定)。
-`max_steps` が ngram と transformer で同じデータ量を意味するので、曲線を
-step 単位でそのまま比較できます。B は同時に**モデル側のハイパーパラメータ**
-でもあります — `in_batch_negative_loss` はバッチ内の他の tail すべてを負例に
-使うため、B-1 が負例数です。
+**バッチサイズは全セル共通の 512** です（`config_large.yaml` /
+`config_xlarge.yaml` の `defaults: batch_size: 512` で、`cells:` 側で
+上書きしていません）。`max_steps` が ngram と transformer で同じデータ量を
+意味するので、曲線を step 単位でそのまま比較できます。B は同時に
+**モデル側のハイパーパラメータ**でもあります — `in_batch_negative_loss` は
+バッチ内の他の tail すべてを負例に使うため、B-1 が負例数です。
+
+（`config_xlarge_compare.yaml` だけは B=256 です。1024 次元の大きい
+エンコーダを 8 種並べるので、一番重いセルが通る値まで下げる必要があり
+ました。前述の「アーキテクチャ比較」節を参照。）
 
 512 は H200 上での実測から決めています（1 学習ステップあたり）:
 
@@ -472,7 +574,7 @@ tail 語彙全体をエンコードする評価パスにも十分な余裕が残
 ファイルに書いた値をその場で上書きできます。
 
 ```bash
-bash benchmarks/run_chembl.sh --max-steps 1000   # small.yaml の 200 を上書き
+bash benchmarks/run_chembl.sh --max-steps 1000   # config_small.yaml の max_steps: 200 を上書き
 ```
 
 #### 設定ファイルは 2 階層
@@ -481,19 +583,25 @@ bash benchmarks/run_chembl.sh --max-steps 1000   # small.yaml の 200 を上書�
 
 | 階層 | 何を書くか | 例 |
 |---|---|---|
-| トップレベル | **run 全体**の設定。セルごとに変えられない | `prep_max_train`, `encoders`, `freezes`, `nproc` |
+| トップレベル | **run 全体**の設定。セルごとに変えられない | `prep_max_train`, `encoders`, `heads`, `freezes`, `protocols`, `nproc` |
+| `defaults:` | **全セル共通**のセル設定 | `max_steps`, `batch_size`, `proj_dim` |
+| `cells: <tag>:` | **そのセルだけ**の設定 | `transformer: {batch_size: 64}` |
+
+どちらの階層に属するかは `kgfm/bench/config.py` の `CELL_FIELDS` が唯一の
+定義で、間違った階層に書くと「どこに書くべきか」を示すエラーになります。
+
+`<tag>` は `<encoder>[_<head>][_frozen]`（`sweep.cell_tag` と同じ。`_<head>` は
+`heads` が 2 つ以上のときだけ付く）で、`encoders × heads × freezes` が実際に
+生成するセルでなければエラーになります。
 
 > **`prep_max_*` は kgfm の学習量ではありません。** これは `kgfm bench prep`
 > が作る entity-ID KG（ULTRA / MOTIF が読むもの）の行数上限です。kgfm 自身は
 > `train_list` の生 TSV を直接ストリームし、この KG を読みません。旧名の
 > `max_train` は run 全体の上限のように見えて紛らわしかったため、接頭辞を
-> 付けました。2 つのベースラインは**同じ** KG を読むので、キャップは
-> 手法ごとではなく 1 組です。学習量を決めるのは `max_steps` / `max_epoch` です。
-| `defaults:` | **全セル共通**のセル設定 | `max_steps`, `batch_size`, `proj_dim` |
-| `cells: <tag>:` | **そのセルだけ**の設定 | `transformer: {batch_size: 64}` |
-
-`<tag>` は `<encoder>` または `<encoder>_frozen`（`sweep.cell_tag` と同じ）で、
-`encoders` × `freezes` が実際に生成するセルでなければエラーになります。
+> 付けました（旧名を書いた config は「代わりにこれを使え」というエラーに
+> なります: `config._RENAMED`）。2 つのベースラインは**同じ** KG を読むので、
+> キャップは手法ごとではなく 1 組です。**kgfm の学習量を決めるのは
+> `max_steps` / `max_epoch`** です。
 
 ```yaml
 prep_max_train: 250000                 # run 全体
@@ -554,8 +662,10 @@ cell transformer_frozen  max_steps=25000 batch_size=512 eval_every=2500 proj_dim
 | `--conda-env NAME` | `kgfm` | 子プロセスを動かす conda env |
 | `--prep-max-train N` / `--prep-max-valid N` / `--prep-max-test N` | 50000 / 2000 / 2000 | ChEMBL prep の三つ組キャップ |
 | `--max-steps N` | 200 | kgfm の学習ステップ数 |
-| `--batch-size N` | 256 | kgfm の学習バッチサイズ (per-device・**全セル**) |
-| `--transformer-batch-size N` | （`--batch-size` と同じ） | transformer エンコーダ系のセルだけバッチサイズを上書き。BERT-base のフル fine-tune は B=1024 で OOM するため、こちらで個別に下げる |
+| `--batch-size N` | 256 | kgfm の学習バッチサイズ (per-device・**全セル**)。セルごとに変えたいときは YAML の `cells: <tag>: batch_size:` を使う（専用フラグ `--transformer-batch-size` は廃止） |
+| `--max-epoch F` | なし | step 数の代わりにエポック数で指定（小数可）。指定すると `--max-steps` は無視 |
+| `--heads LIST` | `auto` | 射影ヘッドのスイープ (`auto,identity,linear,mlp,residual_mlp` から選択)。2 つ以上でセルタグに `_<head>` が付く |
+| `--loss NAME` / `--loss-temperature F` | なし (= `contrastive` / 0.1) | 学習目的関数。詳細はトップレベル README |
 | `--proj-dim N` | （未指定 = `None`） | DistMult 直前に学習可能な `Linear` 射影を挿入。`--freezes on` を使う場合は必須（凍結 LM + `proj_dim=None` だと学習可能パラメータが 0 になる）。ngram に対しても同値であれば `nn.Identity` に縮退するため無害 |
 | `--protocols LIST` | `pooled,filtered` | 最終評価プロトコルのスイープ |
 | `--encoders LIST` | `ngram,transformer` | エンコーダのスイープ |
@@ -576,59 +686,82 @@ cell transformer_frozen  max_steps=25000 batch_size=512 eval_every=2500 proj_dim
 
 ### 全コーパスに対する `--max-*` のカバー率
 
-`list_chembl/{train,valid,test}.txt` から参照される ChEMBL TSV の総量と、
-そこから推定した triple 数に対する各キャップのカバー率は以下の通りです
-（推定法: 全ファイルの合計バイト数 ÷ 158.2 bytes/行。先頭ファイルの
-10,000,000 行 / 1.58 GB という実測値で校正）。
+`list_chembl/{train,valid,test}.txt` から参照される ChEMBL TSV の総量
+（`wc -l` による**実測値**。前節「全コーパス 1 エポック」の表と同じもの）に
+対する、`prep_max_*` のカバー率です。
 
-| split | 全ファイル合計 | 推定 triple 数 | `small.yaml` | `large.yaml` |
+| split | 全ファイル合計 | 行数（実測） | `config_small.yaml` | `config_large.yaml` |
 |---|---|---|---|---|
-| train | 105.4 GB | ~715M | 50,000 ≈ **0.0070%** | 500,000 ≈ **0.070%** |
-| valid |   4.0 GB | ~27.1M |  2,000 ≈ 0.0074% |  10,000 ≈ 0.037% |
-| test  |   6.4 GB | ~43.2M |  2,000 ≈ 0.0046% |  10,000 ≈ 0.023% |
+| train | 105.35 GiB | 674,265,105 | 50,000 ≈ **0.0074%** | 250,000 ≈ **0.037%** |
+| valid |   3.99 GiB |  25,764,240 |  2,000 ≈ 0.0078% |  10,000 ≈ 0.039% |
+| test  |   6.36 GiB |  40,000,000 |  2,000 ≈ 0.0050% |  10,000 ≈ 0.025% |
 
-両既定値とも全コーパスの **0.1% 未満**で、`large` でも 1 epoch には程遠い
-水準です。1% 超を狙う場合は `--prep-max-train` を数百万オーダー（例: 7,000,000
-で約 1%）まで上げてください。エンティティ語彙が ULTRA / MOTIF の推論時
-メモリに収まる範囲を意識する必要があります。
+**繰り返しますがこれは `kgfm bench prep` が作る entity-ID KG のカバー率で、
+kgfm 自身の学習量ではありません**（kgfm は `train_list` の生 TSV を直接
+ストリームします）。つまりこの表が言っているのは「**ULTRA / MOTIF が見ている
+グラフは全コーパスの 0.1% 未満**」ということです。ベースライン側で 1% 超を
+狙う場合は `--prep-max-train` を数百万オーダー（例: 6,700,000 で約 1%）まで
+上げてください。ただしエンティティ語彙が ULTRA / MOTIF の推論時メモリに
+収まる範囲を意識する必要があります（|E| はほぼ劣線形で伸びます —
+50k→72.7k / 200k→231k / 400k→419.3k / 1M→685k）。
 
-### `large.yaml` の狙い
+kgfm 側の学習量は `max_steps` × `batch_size` で、`config_large.yaml` の
+25,000 × 512 = 12.8M examples ≈ **0.0019 エポック**です。全 1 エポックを
+回すのが `config_xxlarge.yaml` です。
+
+### `config_large.yaml` の狙い
 
 ```bash
 bash benchmarks/run_chembl_large.sh
 bash benchmarks/run_chembl_large.sh --encoders ngram --skip motif
-bash benchmarks/run_chembl_large.sh --prep-max-train 7000000   # ~1% 相当
+bash benchmarks/run_chembl_large.sh --prep-max-train 6700000   # ベースラインの KG を全体の ~1% に
 ```
 
-| 設定 | `small.yaml` | `large.yaml` |
+実ファイル（`config_small.yaml` / `config_large.yaml`）の値です。
+
+| 設定 | `config_small.yaml` | `config_large.yaml` |
 |---|---|---|
-| `--prep-max-train`              | 50,000    | **500,000** |
-| `--prep-max-valid`              | 2,000     | **10,000** |
-| `--prep-max-test`               | 2,000     | **10,000** |
-| `--max-steps`              | 200       | **2,000** |
-| `--batch-size`             | 256       | **1,024** |
-| `--transformer-batch-size` | (= `--batch-size`) | **64** |
-| `--proj-dim`               | (未指定) | **256** |
-| `--freezes`                | `off`     | **`off,on`** |
-| `--max-filter-tails`       | 50,000    | **200,000** |
-| `--max-filter-rows`        | 1,000,000 | **5,000,000** |
+| `prep_max_train`   | 50,000    | **250,000** |
+| `prep_max_valid`   | 2,000     | **10,000** |
+| `prep_max_test`    | 2,000     | **10,000** |
+| `max_steps`        | 200       | **25,000** |
+| `batch_size`       | 256       | **512**（全セル共通） |
+| `proj_dim`         | (未指定)  | **256** |
+| `freezes`          | `["off"]` | **`["off", "on"]`** |
+| `n_eval_triples` / `pool_size` | (既定 5,000) | **10,000** |
+| `max_filter_tails` | 50,000    | **310,000** |
+| `max_filter_rows`  | 1,000,000 | **10,000,000** |
 
-transformer 関連デフォルトの意図:
+各値の意図:
 
-- **`--transformer-batch-size 64`**: `kgfm.model.DistMultScorer.encode_triple` は
-  `(h, r, t)` の 3 系列を 1 回の encoder forward にまとめるため、`B=1024` は
-  実質 `3072×128` の BERT-base 入力になり H200 (140GB) でも OOM します。
-  B=64 (実質 192 系列) であれば bf16 オートキャスト + AdamW 状態と合わせて
-  おおむね 60GB 程度に収まり安定して回ります。
-- **`--proj-dim 256`**: `--freezes on` セルの学習に必須です。`proj_dim=None`
-  かつ encoder 凍結だと `nn.Identity` が射影層になり、optimizer に渡る
-  trainable パラメータが 0 になります。ngram (embedding_dim=256) では
-  そのまま Identity に縮退するので、結果としてはフル fine-tune セルへの
-  追加コストはありません。BERT の fine-tune セルは 768→256 の小さな射影を
-  経由する形になります。
-- **`--freezes off,on`**: 同一 encoder を「フル fine-tune」と
+- **`batch_size: 512` は全セル共通**です。エンコーダごとにバッチサイズを
+  変える専用フィールド `transformer_batch_size` は廃止済みで、必要なら
+  `cells: transformer: batch_size:` と書きます。`config_large.yaml` は
+  あえて分けていません — `max_steps` が ngram と transformer で同じデータ量を
+  意味し、学習曲線を step 軸でそのまま重ねられるようにするためです。512 が
+  H200 上の実測最良値である根拠は前節の表にあります。
+  なお `kgfm.model.DistMultScorer.encode_triple` は `(h, r, t)` を 1 回の
+  encoder forward にまとめるため、**B=512 は実質 1,536 系列**です。これが
+  transformer セルのメモリを決めているので、B を上げるときはこの 3 倍を
+  意識してください。
+- **`proj_dim: 256`**: `freezes` に `"on"` が入るとき**必須**です。
+  `proj_dim=None` かつ encoder 凍結だと `DistMultScorer.proj` が
+  `nn.Identity` に縮退し、optimizer に渡る trainable パラメータが 0 に
+  なります（`train()` はこれを検出して DDP のラップを丸ごと飛ばします）。
+  ngram (embedding_dim=256) では 256 を渡してもそのまま Identity に縮退
+  するので、fine-tune セルへの追加コストはありません。transformer の
+  fine-tune セルは 768→256 の小さな射影を経由する形になります。
+- **`freezes: ["off", "on"]`**: 同一 encoder を「フル fine-tune」と
   「frozen + 射影のみ学習」で対比評価します。集計テーブルでは
   `kgfm (transformer)` と `kgfm (transformer, frozen)` の 2 行に分かれます。
+  `ngram` の `"on"` は「凍結できる LM が無い」ので `cell_specs()` が
+  自動的に落とします。
+- **`cells:` で fine-tune セルだけに `encoder_weight_decay: 0.01`** を
+  かけています。この run（`benchmarks/results/chembl/20260809T051610Z_chembl_large/`）
+  で、fine-tune した transformer は train loss が 2.25 → 1.97 と下がり続ける
+  一方 valid loss が step 12.5k を底に上昇したのに対し、head しか学習しない
+  frozen セルでは同じ現象が起きなかったためです。frozen セルの方は
+  `head_dropout: 0.1` を持ちます。
 
 ## セットアップ
 
@@ -670,9 +803,10 @@ CUDA 12.1 で自己完結した env に置く方が安全です。
 (ULTRA: MRR 0.175287 / MOTIF: 0.174047 が `kgfm`・`gnn`・`kgfm-ultra` で
 一致)。`kgfm-ultra` を既定にしているのは、`kgfm` env をベースライン依存
 (とりわけ最新 torch に対する `torch_scatter` のソースビルド) から
-解放できるためです。`kgfm/bench/env.py` が
-`<conda base>/envs/kgfm/bin/python` を明示的に解決するため、シェルで
-どの env を activate しているかに依存しません（`--conda-env` または
+解放できるためです。`kgfm/envs.py` が
+`<conda base>/envs/<env 名>/bin/python` を明示的に解決するため、シェルで
+どの env を activate しているかに依存しません（cron から起動しても
+activate 済みシェルから起動しても同じ挙動になります。env 名は
 `--conda-env` で上書き可能）。副次的な効果として、`meta.json` に
 記録される torch バージョンが 1 つに定まり、実行条件が一意になります。
 
@@ -739,7 +873,7 @@ GPU/CPU メモリに余裕があれば増やしてください。
 > activity ID で分けられており train ファイルに含まれる ID は他の
 > ファイルにほとんど現れないため、strict transductive で語彙を凍結
 > すると test がほぼ空になります。`--strict-transductive` を渡すと
-> 従来の transductive 設定になります。`stats.json` の `mode` フィールドで
+> 語彙を凍結する transductive 設定になります。`stats.json` の `mode` フィールドで
 > どちらだったかを確認できます。
 
 ---
@@ -877,9 +1011,11 @@ kgfm bench run --skip viz          # 射影を飛ばす
 | valid loss by step | 汎化性能の比較 |
 | validation MRR by step | 最終指標での比較 |
 
-> セル横断の学習曲線は x 軸を **examples seen** にしています。ngram
-> (B=1024) と transformer (B=64) では同じ step 数でも見たデータ量が 16 倍
-> 違うため、step 軸で重ねると誤解を招きます。
+> セル横断の学習曲線は x 軸を **examples seen**（= step × バッチサイズ）に
+> しています。同梱の config はどれも全セル同じ `batch_size` なので現状は
+> step 軸と比例しますが、`cells: <tag>: batch_size:` でセルごとに変えた
+> run では step 軸に重ねると見たデータ量が違うものを並べることになるため、
+> examples 軸を既定にしています。
 
 **Cross-method comparison セクション内 (最終指標)**
 
@@ -1013,12 +1149,51 @@ MRR / Hit@K の **分母は実質 `2 × n_eval`** です。kgfm は tail 片方�
   「フィルタが完全」「候補集合が全エンティティ」の状態に持っていくのが
   ULTRA / MOTIF と最もフェアな比較条件です。
 
+### filtered の落とし穴 2 つ
+
+**(1) `kgfm eval --protocol filtered` と `kgfm bench cell` は既定の filter
+集合が違います。** `kgfm bench cell` は KG 完成タスクの標準どおり
+**train + valid + test** の和集合から filter index を作りますが、
+`kgfm eval` の既定は **test だけ**です。したがって**ベンチマークの
+チェックポイントを `kgfm eval` で再スコアすると、何も間違えていないのに
+違う（＝甘い）数字が出ます**。実測: xxlarge のチェックポイントを同じ
+`max_filter_tails` で再スコアすると、test のみの既定で MRR 0.4886、
+train+valid+test で 0.4555 でした。再スコアするときは `--filter-list` を
+3 つとも明示してください（トップレベル README の「評価プロトコル」節の
+コマンド例がその形です）。
+
+比較したい 2 つの JSON がほんとうに同じ条件かは、`metrics` の中の
+**`filter_pairs`（filter index に入った `(h,r)` の数）と
+`tails_outside_vocab`** を見れば分かります。プロトコルが一致していれば
+この 2 つは完全に一致します。なお `max_filter_rows` は語彙の大きさを
+決めているにもかかわらず**指標はほとんど動きません** — xxlarge の
+チェックポイントで無制限と 10M がどちらも MRR 0.48858357 でした。理由は
+(2) です。逆に **filter 集合の選び方 (train+valid+test か test だけか) は
+0.03 以上動く**ので、効くのはそちらだと覚えてください。
+
+**(2) 評価対象の tail の約 93% は filter 語彙の外にあります。** これは
+どの run でも一貫していて（92.8〜94.2%。xxlarge では 12,032 件中 11,162 件
+= 92.8%）、ファイル単位の inductive 分割の帰結です — test のエンティティは
+filter ファイル側とは別の集団だからです。語彙に無い真の tail は候補列に
+追加してから順位を取るので**指標の計算自体は一貫していて、同じ語彙で
+取った run どうしは比較できます**。ただし**教科書的な filtered MRR とは
+別物なので、外部の公開値と並べて引用しないでください。**
+
 ---
 
-## 動作確認時の実測値
+## 動作確認時の実測値（3 手法が同じ run で揃っている唯一の記録）
 
-データ: `kgfm bench prep --prep-max-train 50000 --prep-max-valid 2000 --prep-max-test 2000`
-（|E| = 72,669, |R| = 22, inductive モード）、kgfm は 200 steps。
+出典は `benchmarks/results/chembl/20260808T073317Z_fulltest/table.md` です。
+データ: `kgfm bench prep --prep-max-train 50000 --prep-max-valid 2000
+--prep-max-test 2000`（|E| = 72,669, |R| = 22, inductive モード）、kgfm は
+200 steps。**これは「3 手法が同じ実行ディレクトリで動くこと」を確認するための
+スモークで、kgfm の性能を示す数字ではありません** — kgfm 側は 200 step
+（`config_small.yaml`）しか学習していません。kgfm の実力は
+`20260811T230140Z_chembl_xlarge_compare`（6,000 step、filtered MRR 最良
+0.4641）と `20260816T053252Z_chembl_xxlarge`（1 エポック、filtered 0.4410 /
+pooled 0.5164）を見てください。ただし**それらの run には ULTRA / MOTIF の行が
+ありません**（ベースラインは prep された KG を読むので、`kgfm-ultra` /
+`kgfm-motif` を同じディレクトリに後から足すことは可能です）。
 
 | 手法 | Protocol | MRR | Hit@1 | Hit@3 | Hit@10 | MR | n_eval |
 |---|---|---|---|---|---|---|---|
@@ -1029,20 +1204,29 @@ MRR / Hit@K の **分母は実質 `2 × n_eval`** です。kgfm は tail 片方�
 | ULTRA (zero-shot) | filtered | **0.1753** | 0.1532 | 0.1993 | 0.2100 | 5702.79 | 2000 |
 | MOTIF (zero-shot) | filtered | **0.1740** | 0.1470 | 0.2003 | 0.2100 | 7650.40 | 2000 |
 
-> transformer の行は学習率修正後 (`lr=3e-5`) の値です。修正前 (`lr=1e-3`)
-> は完全に崩壊しており、同順位の許容誤差判定と合わせて
-> pooled 0.9330 / filtered 0.0004 という無意味な値でした。
+> transformer の行は**エンコーダごとの学習率**（`train.default_lr()`、
+> transformer の fine-tune は `lr=3e-5`）を入れたあとの値です。それ以前は
+> ngram 用の `1e-3` が transformer にもかかっていて完全に崩壊しており、
+> しかも当時の同順位判定（許容誤差なし）と組み合わさって
+> pooled 0.9330 / filtered 0.0004 という無意味な値を出していました。
+> 両方の詳細は後述の「学習率はエンコーダごとに決まります」と
+> 「評価指標の注意点: 同順位の扱い」にあります。
+> **`benchmarks/results/chembl/` の 2026-06 以前の run（`20260522T101455Z` の
+> transformer 行 0.8686 など）はこの崩壊状態の値**なので、参照しないで
+> ください。
 
-- ULTRA / MOTIF の値は以前の計測と完全に一致します（リファクタ後も同じ
-  結果が再現されることの確認）。`kgfm` / `gnn` / `kgfm-ultra` のどの env で
-  実行しても指標が一致することも確認済みです。
-- kgfm の値はチェックポイント選択の変更で以前の記録から変わりました。
-  in-loop validation を必ず走らせるようにしたため、最終評価が
-  `final.pt`（最終ステップ）ではなく `best.pt`（valid MRR 最良）を
-  読むようになったためです（`train.py` の本来の設計どおりの挙動）。
-  なお ChEMBL の file-level inductive 分割では valid と test の傾向が
-  かなり違い、valid MRR は step 20〜40 で頭打ちなのに test MRR は
-  step 200 まで伸び続けます（valid が test の良い代理になっていない）。
+- ULTRA / MOTIF の値は、この 2 つを `kgfm/baselines/` に切り出すリファクタの
+  前後で完全に一致しています（同じ結果が再現されることの確認）。
+  `kgfm` / `gnn` / `kgfm-ultra` のどの env で実行しても指標が一致することも
+  確認済みです（`gnn` env は現在使っていません）。
+- **kgfm の最終評価は `best.pt`（valid MRR 最良）を読みます**。
+  `final.pt`（最終ステップ）ではありません。in-loop validation を必ず
+  走らせるようにしたことで、`train.py` の本来の設計どおりの挙動に
+  なりました。ただし ChEMBL の file-level inductive 分割では valid と test の
+  傾向がかなり違い、200 step のスモークでは valid MRR が step 20〜40 で
+  頭打ちなのに test MRR は step 200 まで伸び続けます（**valid が test の
+  良い代理になっていない**）。best.pt を選ぶことが必ずしも test 最良を
+  選ぶことにならない、という含みがあります。
 - **学習は run 間で再現しません。** `StreamingTripleDataset` は
   `IterableDataset` で、`num_workers>1` だとワーカー間のバッチ到着順が
   非決定的なため、同じ seed でも別の run になります。
@@ -1055,7 +1239,7 @@ MRR / Hit@K の **分母は実質 `2 × n_eval`** です。kgfm は tail 片方�
 | `--loss` | 内容 |
 |---|---|
 | `contrastive` **(既定)** | InfoNCE / NT-Xent（正規化 cosine を温度で割る） |
-| `softmax_ce` | 生スコアの softmax 交差エントロピー（本モジュール以前の挙動） |
+| `softmax_ce` | 生スコアの softmax 交差エントロピー（`kgfm/losses.py` を入れる前の唯一の目的関数。2026-08-09 より前の run はすべてこれ） |
 | `bce` | 候補ごとの二値交差エントロピー（ConvE の 1-N scoring） |
 | `margin` | max-margin ヒンジ（TransE 系） |
 | `self_adversarial` | RotatE の self-adversarial negative sampling |
@@ -1066,7 +1250,7 @@ MRR / Hit@K の **分母は実質 `2 × n_eval`** です。kgfm は tail 片方�
 または YAML の `loss:` / `loss_temperature:` で指定できます。
 
 ```bash
-kgfm bench run --config large --loss softmax_ce   # 従来挙動で回す
+kgfm bench run --config large --loss softmax_ce   # 2026-08-09 より前の挙動で回す
 ```
 
 ### 学習率はエンコーダごとに決まります
@@ -1080,7 +1264,8 @@ kgfm bench run --config large --loss softmax_ce   # 従来挙動で回す
 | transformer | off | `3e-5` | 事前学習済み LM の fine-tune (標準は 2e-5〜5e-5) |
 | transformer | on | `1e-3` | 学習するのは小さな射影ヘッドだけなので大きい方 |
 
-以前は両方 `1e-3` 固定で、**BERT は完全に崩壊していました**: 200 step で
+`default_lr()` が入る前は両方 ngram 用の `1e-3` 固定で、
+**BERT は完全に崩壊していました**: 200 step で
 loss が 5.5498 → 5.5466 とほぼ動かず、無関係なテキスト同士の埋め込みの
 cos 類似度が **1.000000**。`3e-5` では 120 step で loss 3.2551 → 1.7588、
 cos 類似度 0.95 (BERT 本来の異方性の範囲) と正常に学習します。勾配ノルムも
@@ -1088,14 +1273,17 @@ cos 類似度 0.95 (BERT 本来の異方性の範囲) と正常に学習しま�
 
 ### 評価指標の注意点: 同順位の扱い
 
-順位計算は「真の tail より**厳密に大きい**スコアの数 + 1」でした。この
-定義だと**全候補のスコアが同じモデル（= 崩壊したモデル）が rank 1、
-つまり MRR = 1.0 を取ります**。実際、崩壊した transformer セルが
-`MRR: 1.0` を報告しました。
+`eval._ranks_with_ties` の話です。素朴な実装は順位を「真の tail より
+**厳密に大きい**スコアの数 + 1」と定義しますが、この定義だと**全候補の
+スコアが同じモデル（= 崩壊したモデル）が全候補について rank 1、つまり
+MRR = 1.0 を取ってしまいます**。仮定ではなく実際に起きていて、
+`benchmarks/results/chembl/20260606T090031Z/table.md` の transformer 行が
+filtered で `1.00` を報告しています。
 
 現在は KG 完成タスクの標準である**同順位の平均**（楽観順位と悲観順位の
 平均 = `#greater + (#tied + 1) / 2`）を使っています。同順位が無ければ
-従来と完全に同値で、実際 ngram セルの数値は小数 6 桁まで不変でした。
+厳密比較の定義と完全に同値になるので、実際 ngram セルの数値は小数 6 桁まで
+不変でした。
 
 同順位判定には**許容誤差**を使います (`torch.isclose`, `TIE_RTOL=1e-5` /
 `TIE_ATOL=1e-8`)。厳密な等値だけでは不十分だからです — 崩壊モデルでは
@@ -1173,7 +1361,7 @@ MRR 0.498 を出すこと、ChEMBL でも上記の通り MRR 0.175 を出して�
 程度で終わります。
 
 ```bash
-python benchmarks/run_ultra.py --gpus null
+kgfm-ultra --out-dir latest --gpus null   # --gpus null が既定なので省略可
 ```
 
 ---
@@ -1201,13 +1389,17 @@ kgfm/                       # 処理の本体はすべてここ
 
 benchmarks/                 # シェルは薄いラッパのみ
 ├── README.md               # 本書
-├── run_chembl.sh           # bench run → ultra → motif → report
+├── run_chembl.sh           # bench run → ultra → motif → report (config_small.yaml)
+├── run_chembl_middle.sh    # --config benchmarks/config_middle.yaml
 ├── run_chembl_large.sh     # --config benchmarks/config_large.yaml
 ├── run_chembl_xlarge.sh    # --config benchmarks/config_xlarge.yaml
-├── run_chembl_large_2gpu.sh   # 同上 + --nproc 2
-├── run_chembl_xlarge_2gpu.sh  # 同上 + --nproc 2
-├── small.yaml / large.yaml / xlarge.yaml   # スケール設定
-├── resume_chembl.sh        # 上記 + --resume
+├── run_chembl_xlarge_compare.sh  # --config benchmarks/config_xlarge_compare.yaml (28 セル)
+├── run_chembl_xxlarge.sh   # --config benchmarks/config_xxlarge.yaml (全 674M 行 1 エポック)
+├── run_chembl_large_2gpu.sh   # config_large.yaml  + --nproc 2
+├── run_chembl_xlarge_2gpu.sh  # config_xlarge.yaml + --nproc 2
+├── config_small.yaml / _middle / _large / _xlarge /
+│   _xlarge_compare / _xxlarge.yaml         # スケール設定
+├── resume_chembl.sh        # config_large.yaml + --resume <target>
 ├── setup_baselines.sh      # ULTRA / MOTIF の clone + 依存チェック
 ├── setup_baseline_env.sh   # ベースライン用 env (kgfm-ultra) を構築
 ├── ULTRA/                  # 上流クローン (gitignore)
@@ -1228,15 +1420,24 @@ benchmarks/                 # シェルは薄いラッパのみ
 
 ## 細かい注意事項
 
-- **ULTRA dataset シム** — `run_ultra.py` は `ultra/datasets_chembl.py`
-  ではなく `ultra/datasets.py` 末尾に直接追記する形で `ChEMBLCustom` を
-  注入します（ULTRA は `getattr(ultra.datasets, <ClassName>)` で
-  クラスを解決するため）。upstream で `TransductiveDataset` がリネーム
-  されたら、`run_ultra.py` 冒頭のテンプレートを編集してください。
+実装は `kgfm/baselines/` にあります（`common.py` に共通処理、`ultra.py` /
+`motif.py` は `Baseline` インスタンス + `main()` だけ）。以前の
+`benchmarks/run_ultra.py` / `run_motif.py` はこの 2 コマンドに置き換わって
+おり、リポジトリには残っていません。
+
+- **ULTRA dataset シム** — `kgfm/baselines/common.py` は
+  `ultra/datasets_chembl.py` のような別モジュールを作るのではなく、
+  `ultra/datasets.py` の末尾に直接 `ChEMBLCustom` を追記します（ULTRA が
+  `getattr(ultra.datasets, <ClassName>)` でクラスを解決するため、別モジュール
+  では見つけてもらえません）。upstream で `TransductiveDataset` が
+  リネームされたら、`common.py` 内のクラステンプレート文字列を編集して
+  ください。
 - **MOTIF CLI** — MOTIF は ULTRA から派生したコードベースで、
   `script/run.py` のフラグ規約 (`--dataset --gpus --epochs --bpe --ckpt`)
-  も同一です。`run_motif.py` も `run_ultra.py` とほぼ並行な構造に
-  なっています。
+  も同一です。そのため `motif.py` は `ultra.py` とほぼ同じ `Baseline`
+  定義になっています。手法を 1 つ足すときも、`Baseline` を 1 個定義して
+  コンソールスクリプトを生やすだけです。
 - **GPU メモリ** — ULTRA の NBFNet メッセージパッシングは `|E| · L`
   (L はレイヤ数) でスケールします。OOM になったら `--prep-max-train` を
-  下げるか、`run_ultra.py` 内の batch_size を縮めてください。
+  下げるか、`kgfm-ultra --bpe` / upstream の設定 YAML 側で batch size を
+  縮めてください。

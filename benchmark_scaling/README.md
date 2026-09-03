@@ -17,19 +17,43 @@
 ## 使い方
 
 ```bash
-bash benchmark_scaling/run_scaling_smoke.sh    # 数分。まずこれで通しを確認
-bash benchmark_scaling/run_scaling.sh          # 本番（5 サイズ、約 1.1 時間）
-bash benchmark_scaling/run_scaling_frozen.sh   # 凍結エンコーダ版（7B を含む）
-bash benchmark_scaling/resume_scaling.sh latest
+bash benchmark_scaling/run_scaling_smoke.sh     # 数分。まずこれで通しを確認
+bash benchmark_scaling/run_lr_probe.sh          # サイズごとの学習率を測る
+bash benchmark_scaling/run_lr_probe_extend.sh   # 上の格子を下側に拡張
+bash benchmark_scaling/run_scaling_scratch.sh   # ★ 本番（ランダム初期化 7 サイズ）
+bash benchmark_scaling/run_scaling.sh           # 事前学習済み 9 エンコーダ
+bash benchmark_scaling/run_scaling_frozen.sh    # 凍結エンコーダ版（7B を含む）
+bash benchmark_scaling/resume_scaling.sh latest # 中断した run の再開
 ```
 
-各スクリプトは 3 コマンドです。
+**中心になるのは `run_scaling_scratch.sh`** です。サイズ軸から事前学習量を
+外したかったので、ランダム初期化の `scratch-*` 7 サイズを回します
+（4.4M / 11.2M / 28.8M / 41.4M / 109.5M / 234.6M / 335.4M、48,000 step、
+合計約 26 時間）。**先に `run_lr_probe.sh` + `run_lr_probe_extend.sh` を
+回して、サイズごとの学習率を決める必要があります** — 固定の学習率で回すと
+サイズ軸が壊れます（後述「4. LR がサイズに合っていない」）。すでに測った値は
+`config_scaling_scratch.yaml` の `cells:` に入っているので、条件を変えない
+なら再測は不要です。
+
+`run_scaling.sh`（`config_scaling.yaml`）は**事前学習済みモデルの側**で、
+`bert-tiny/mini/small/medium` + `ngram` + `mpnet` + `bert-multilingual` +
+`bge-large` + `xlm-roberta-large` の 9 セル × 4,000 step です。
+scratch 側の指数との差が「事前学習が何を寄与しているか」に対応します。
+
+各スクリプトは 3 コマンドです（`kgfm bench run` が学習、`kgfm report` が
+通常のベンチマークレポート、`kgfm scaling` がスケーリングレポート）。
 
 ```bash
 kgfm bench run --config benchmark_scaling/config_scaling.yaml
 kgfm report  --out-dir latest --results-root benchmark_scaling/results/chembl
 kgfm scaling --out-dir latest --results-root benchmark_scaling/results/chembl
 ```
+
+`kgfm report` に `--results-root` を渡しているのは、その既定が
+`benchmarks/results/chembl`（手法比較側）で、そのままだと別のツリーの
+`latest` を見てしまうためです（`kgfm scaling` の既定は
+`benchmark_scaling/results/chembl` なので不要ですが、対称性のために
+明示しています）。`kgfm bench run` は config の `results_root:` を使います。
 
 ## 設計: 1 本の学習曲線が 1 本のスケーリング曲線
 
@@ -210,11 +234,23 @@ eval の上乗せが 0.4 GiB なので、アロケータがキャッシュを吐
 フィットはフロンティア（各予算の最良点）に対して行います。全点で回帰すると
 「どれだけ長く回したか」を測ることになり、「その予算での最良性能」になりません。
 
-## 3 つの交絡と、その外し方
+## 4 つの交絡と、その外し方
 
-2026-08-24 の run は「BERT に絞っても scaling law が見えない」という結果でした。
-原因は法則が無いことではなく、**指数を潰す要因が 3 つ重なっていた**ことです。
-以下はそれぞれへの対処で、いずれもコード側に入っています。
+最初の本番 run（`results/chembl/20260824T221208Z_scaling/`、事前学習済み
+9 セル × 4,000 step）は「BERT 系統に絞っても scaling law が見えない」
+という結果で、プールしたフィットが `C^-0.0186`、R² = 0.40 でした。
+原因は法則が無いことではなく、**指数を潰す要因が重なっていた**ことです。
+以下の 4 つがそれで、それぞれへの対処はいずれもコード側に入っています
+（1〜3 は `kgfm/scaling/` のレポート側、4 は config 側）。
+
+1. y 軸（validation loss）に天井と床がある → `1 − MRR` の軸を併記
+2. 系統をまたいでフィットするとレシピとサイズが混ざる → 系統内でも別々にフィット
+3. `L = a·C^b` は log-log で曲がれない → 床つき `L = L∞ + a·C^b` も同時にフィット
+4. 学習率がサイズに合っていない → サイズごとに振る（`lr_probe.py`）
+
+途中に挟まっている「おまけ: early stopping は入れてはいけない」は
+5 つ目の交絡ではなく、**これらの対処を入れたあとに新しく入れてはいけない
+もの**の話です。
 
 ### 1. y 軸に天井がある — だから 1 − MRR も並べて出す
 
@@ -232,7 +268,8 @@ eval の上乗せが 0.4 GiB なので、アロケータがキャッシュを吐
 プールに対する順位なので、目的関数側の天井を持ちません。冪則は 0 に向かって
 減衰する量に対する主張なので、MRR そのものではなく誤差 `1 − MRR` を使います。
 
-実測（2026-08-24 の run、BERT 系統のみ）:
+実測（`results/chembl/20260824T221208Z_scaling/` の run、`bert-tiny/mini/small/medium` の
+1 系統だけを取り出したフィット）:
 
 | y 軸 | 指数 b | R² |
 |---|---|---|
@@ -290,8 +327,9 @@ L = L∞ + a·C^b
 ### おまけ: early stopping は入れてはいけない
 
 検証損失は**二相性**を持ちます。大きいセルは「下がる → 数千 step 悪化する →
-再び下がって、はるかに良い最小値に達する」という形です。実測（2026-08-26、
-各セル 64 点）:
+再び下がって、はるかに良い最小値に達する」という形です。実測
+（`results/chembl/20260826T052153Z_scaling_scratch/`、5 サイズ × 16,000 step、
+`eval_every: 250` なので各セル 64 点）:
 
 | セル | 前半25%の最良 | それ以降の最良 | 差 |
 |---|---|---|---|
@@ -320,9 +358,22 @@ L = L∞ + a·C^b
 混合になります。
 
 ```bash
-bash benchmark_scaling/run_lr_probe.sh             # scratch-* 系統
+bash benchmark_scaling/run_lr_probe.sh             # scratch-*、格子 1e-4 … 3e-3
+bash benchmark_scaling/run_lr_probe_extend.sh      # 同じ系統を 1e-5 / 3e-5 に拡張
 bash benchmark_scaling/run_lr_probe_pretrained.sh  # 事前学習済み系統
 ```
+
+`run_lr_probe.sh` の格子（1e-4 … 3e-3）では小さいサイズがすべて**下端の
+1e-4 で勝ってしまった**ので、`run_lr_probe_extend.sh` で格子を下に伸ばして
+います。**端で勝った値は最適値ではなく上限**なので、内点になるまで下げる
+必要があります。`summarize_lr_probe.py` に複数のディレクトリを渡すと 1 枚の
+表にまとまるので、両者の結果は合成できます。
+
+実測結果は `benchmark_scaling/results/lr_probe_*/` に残っています
+（`lr_probe_scratch` / `_low` / `_low2` が 41M までの格子、`_base` 付きが
+`scratch-base`、`lr_probe_scratch_xl` と `_large` が上 2 サイズ。各ディレクトリに
+`lr_probe.json`（全 (encoder, lr) の validation 履歴）と `summary.txt`
+（表 + 貼れる `cells:` ブロック）があります）。
 
 各 (encoder, lr) を短く回し、**validation loss と MRR の両方**の表を出して、
 そのまま `cells: <tag>: lr:` に貼れるブロックを出力します。
@@ -367,8 +418,10 @@ bash benchmark_scaling/run_lr_probe_pretrained.sh  # 事前学習済み系統
 （MRR: 1e-6 0.3331 / 3e-6 0.4204 / 1e-5 0.4019 / 3e-5 崩壊）。
 
 この 335M のセルは**そもそも回せませんでした** — 3 レートすべてが最初の
-in-loop evaluation で OOM して rc=1 で落ちていました（旧ログは
-`results/lr_probe_scratch_large_prefix_oom/`）。上の grad モードの修正で
+in-loop evaluation で OOM して rc=1 で落ちていました（そのときのログが
+`results/lr_probe_scratch_large_prefix_oom/` に残っています）。前述の
+「評価時メモリ — サイズ軸の上端を決めていたのは grad モードだった」の修正
+（`TransformerEncoder.forward` が外側の `no_grad` を継承するようにした）で
 4 セルとも完走します。
 
 なお `scratch-large` の 2000 step 時点の最良値 (3.2652) は `scratch-base`
@@ -402,27 +455,47 @@ medium は崩壊閾値が同じで、しかも medium の方が良い (3.1714 �
 わけです。これを外すために、同じアーキテクチャを**ランダム初期化**で使う
 プリセットを用意しています。
 
-| プリセット | パラメータ数 | アーキテクチャ |
-|---|---|---|
-| `scratch-tiny` | 4.4M | `prajjwal1/bert-tiny` の config のみ |
-| `scratch-mini` | 11.2M | `prajjwal1/bert-mini` |
-| `scratch-small` | 28.8M | `prajjwal1/bert-small` |
-| `scratch-medium` | 41.4M | `prajjwal1/bert-medium` |
-| `scratch-base` | 109.5M | `bert-base-uncased` |
+| プリセット | パラメータ数 | 層 × 幅 | config の出どころ |
+|---|---|---|---|
+| `scratch-tiny` | 4.4M | 2 × 128 | `prajjwal1/bert-tiny` |
+| `scratch-mini` | 11.2M | 4 × 256 | `prajjwal1/bert-mini` |
+| `scratch-small` | 28.8M | 4 × 512 | `prajjwal1/bert-small` |
+| `scratch-medium` | 41.4M | 8 × 512 | `prajjwal1/bert-medium` |
+| `scratch-base` | 109.5M | 12 × 768 | `bert-base-uncased` |
+| `scratch-xl` | 234.6M | 16 × 1024 | `bert-large-uncased` + `num_hidden_layers: 16` |
+| `scratch-large` | 335.4M | 24 × 1024 | `bert-large-uncased` |
+
+1.9 decade（約 76 倍）の N をカバーします。`scratch-xl` は
+「`bert-large` の 24×1024 が載らないように見えた」ときに間の点として
+足したものですが、実際は載る（前述の「評価時メモリ」の節）ので、代替ではなく
+**サイズ軸の内点**として残っています。`scratch-large` の 335M が H200 1 枚の
+上端で、律速しているのは学習側です（B=256 で train_peak 101.81 GiB /
+139.8 GiB）。B は in-batch 負例数そのものなので下げられず、その次のサイズは
+今の構成では回せません。
 
 `random_init: True` は `AutoModel.from_config()` を通り、重みを一切
 ダウンロードしません（tokenizer だけ取ります）。学習率の既定値も
-`train.SCRATCH_LR = 1e-4` に分かれています — 3e-5 は事前学習済みモデルを
-壊さないための値で、ゼロから学習するには小さすぎます。
+`train.SCRATCH_LR = 1e-4` に分かれています（`encoders.is_random_init()` で
+振り分け）— 事前学習済みモデル用の 3e-5 は「既存の重みを壊さない」ための
+値でここでの制約ではなく、ngram 用の 1e-3 は BERT を確実に崩壊させるためです。
+**ただしこの 1e-4 が適切なのは最小サイズだけ**なので、実際の実験では
+`cells:` でサイズごとに設定します（前述の
+「4. LR がサイズに合っていない」参照）。
 
 ## データ順序: ファイルはインターリーブして読む
 
 ChEMBL の TSV は activity ID で分割されているので、**1 ファイル = 1 つの
-エンティティ集団**です。`StreamingTripleDataset` は以前、各ファイルを最後まで
-読んでから次に移っていました。1 ファイルが 1000 万行あるので、25k step の run は
-どのファイルも読み終わらず、**学習ストリームは「分布の列」であって 1 つの
-分布ではありませんでした**。これは非 i.i.d. なので、勾配は常に直近のファイルの
-偏りを追いかけることになります。
+エンティティ集団**です。`StreamingTripleDataset` は 2026-08-25 より前は各
+ファイルを最後まで読んでから次に移っていました。1 ファイルが 1000 万行ある
+ので、25k step の run はどのファイルも読み終わらず、**学習ストリームは
+「分布の列」であって 1 つの分布ではありませんでした**。これは非 i.i.d. なので、
+勾配は常に直近のファイルの偏りを追いかけることになります。
+
+**この変更はスケーリング則の測定に直接効きます。** 学習ストリームが「分布の列」
+だと validation loss の推移に集団の切り替わりが乗り、それを容量の効果と
+区別できません。`results/chembl/` の run のうち `20260824T*` はこの変更より
+前、`20260826T*` / `20260827T*` は後なので、**両者の loss の絶対値は
+比較できません**（フィットの指数だけを比べてください）。
 
 現在は既定でラウンドロビンに読みます（`interleave_files: True`、
 `interleave_chunk` 行ずつ）。行の多重集合は完全に同一で、順序だけが変わります
@@ -430,14 +503,20 @@ ChEMBL の TSV は activity ID で分割されているので、**1 ファイル
 先頭 2000 行の平均 tail 長は連結読みで 26.6（1 ファイル目の値そのもの）、
 インターリーブで 39.7（2 ファイルの中間）でした。
 
-以前の挙動を再現したい場合のみ `--no-interleave-files` を渡してください。
+`--no-interleave-files` は **2026-08-25 より前の run を再現するためだけの
+フラグ**です。新しく実験するときに渡す理由はありません。
 validation loss 側も既定でシャッフルします（`--no-valid-loss-shuffle` で無効化）
 — シャッフルしないと in-batch 負例が「たまたま隣にいた行」になり、
 本来の課題より簡単にも難しくもなります。
 
 ## 最新 run の結果（`20260827T040036Z_scaling_scratch`、48k step、7 サイズ）
 
-各セル自身の実測 LR、B=256、`max_steps=48000`（= 0.0182 エポック）。
+`benchmark_scaling/results/chembl/20260827T040036Z_scaling_scratch/` の中身が
+出どころです。`scaling_table.md` に params / best valid loss / PF-days、
+`table.md` に最終 test 指標、`scaling_points.json` に全データ点とフィット結果、
+`cell_scratch-*.log` に学習ログがあります。`run_scaling_scratch.sh` を
+そのまま回した結果で、各セル自身の実測 LR（`config_scaling_scratch.yaml` の
+`cells:`）、B=256、`max_steps=48000`（= 0.0182 エポック）です。
 
 | セル | params | best valid loss | @step | best MRR (in-loop) | 最終 test MRR | 学習時間 |
 |---|---|---|---|---|---|---|
