@@ -1,0 +1,49 @@
+# Scaling study, smoke scale — proves the pipeline end to end in minutes.
+#
+# Same two-level layout as benchmarks/config_*.yaml (run-level keys at the top,
+# cell-level under `defaults:` / `cells:`); the only structural difference is
+# `results_root`, which puts the run under benchmark_scaling/results/chembl/
+# instead of benchmarks/results/chembl/.
+#
+# WHAT A SCALING RUN IS
+# The sweep axis is *model size*: one cell per encoder, all trained on the same
+# data with the same batch size and the same head. Each cell's in-loop
+# validation history then becomes one line on the compute axis, because
+# `kgfm scaling` reads (step, valid loss, tokens) back out of the cell logs.
+# There is no separate "data axis" sweep — a training run traces its own data
+# axis as it goes, which is exactly what a Kaplan-style plot wants.
+
+run_label: scaling_small
+results_root: benchmark_scaling/results/chembl
+
+# --- run-level ---
+prep_max_train: 50000
+prep_max_valid: 2000
+prep_max_test: 2000
+
+# Ordered small -> large. `ngram` is included as the no-pretraining floor even
+# though it cannot go on the FLOPs axis (an EmbeddingBag lookup does no work
+# proportional to its parameters); the report marks it rather than plotting a
+# wrong point.
+encoders: [ngram, mpnet, bert-multilingual]
+heads: [linear]
+freezes: ["off"]
+protocols: [pooled]
+
+# --- every cell ---
+defaults:
+  max_steps: 60
+  batch_size: 64
+  proj_dim: 256
+
+  # A scaling curve is only as dense as its validation points, so this is far
+  # more frequent than a normal benchmark would use. `valid_loss_batches` must
+  # be > 0 or there is no y-axis at all.
+  eval_every: 10
+  valid_loss_batches: 4
+  log_every: 5
+
+  n_eval_triples: 500
+  pool_size: 500
+  max_filter_tails: 5000
+  max_filter_rows: 100000

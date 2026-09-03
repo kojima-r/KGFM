@@ -1,0 +1,47 @@
+# Scaling study, frozen encoders — "what does the pretrained representation
+# already know?", measured against compute rather than against wall clock.
+#
+# The companion to config_scaling.yaml. Every cell is frozen, so only the
+# projection head trains and the axis means the same thing for all of them:
+#   compute  = 2*N*T for the encoder (forward only — no backward through the
+#              LM) + 6*N_head*V for the head
+#   "size"   = the ENCODER's parameters, which is what actually varies; the
+#              trainable count is just the head and is nearly constant.
+# That is also why e5-mistral-7b belongs here and not in the fine-tuning
+# study: frozen is the only way it runs at all.
+#
+# Note the head is the entire trained model in every cell, so this study
+# measures representation quality per FLOP, not learning capacity.
+
+run_label: scaling_frozen
+results_root: benchmark_scaling/results/chembl
+
+prep_max_train: 400000
+prep_max_valid: 12000
+prep_max_test: 12000
+
+encoders:
+  - mpnet                # 110M
+  - bert-multilingual    # 178M
+  - bge-large            # 335M
+  - xlm-roberta-large    # 560M
+  - e5-mistral-7b        # 7.1B, bf16
+heads: [linear]
+freezes: ["on"]          # frozen everywhere; `proj_dim` is mandatory with it
+protocols: [pooled]
+
+defaults:
+  max_steps: 4000
+  batch_size: 256
+  # Mandatory when freezing: without a projection the model has no trainable
+  # parameters at all and the optimizer sees nothing.
+  proj_dim: 256
+
+  eval_every: 100
+  valid_loss_batches: 8
+  log_every: 50
+
+  n_eval_triples: 6000
+  pool_size: 6000
+  max_filter_tails: 460000
+  max_filter_rows: 10000000

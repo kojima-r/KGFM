@@ -1,0 +1,117 @@
+# Scaling study — how validation loss falls with compute, across model sizes.
+#
+# Same file format and pipeline as benchmarks/config_*.yaml; only
+# `results_root` differs, so runs land under benchmark_scaling/results/chembl/.
+#
+# THE DESIGN
+# The sweep axis is *model size*: one cell per encoder, every other setting
+# held fixed. Each cell's in-loop validation history is then re-read by
+# `kgfm scaling` as a line on the compute axis — a model does not need one run
+# per compute budget, because a single run passes through every budget below
+# its own on the way. That is why `eval_every` is much more frequent here than
+# in a normal benchmark: validation points ARE the data points.
+#
+# WHAT IS HELD FIXED, AND WHY
+#   batch_size 256   B-1 is the in-batch negative count, so varying it would
+#                    change the task itself and not just the compute.
+#   proj_dim 256     the scoring width; varying it would confound "bigger
+#                    encoder" with "wider score".
+#   head linear      one head, so the cell tags stay `<encoder>` and the study
+#                    varies exactly one thing.
+#   max_steps        equal for every cell, so each line spans the same amount
+#                    of DATA and differs only in compute-per-step.
+#
+# MODEL SIZES (trainable parameters, fine-tuned unless noted)
+#   bert-tiny            4.4M   \
+#   bert-mini           11.2M    | one pretrained family, four sizes
+#   bert-small          28.8M    | (Turc et al. 2019)
+#   bert-medium         41.4M   /
+#   mpnet              110M
+#   bert-multilingual  178M
+#   bge-large          335M
+#   xlm-roberta-large  560M
+#   ngram              268M of EmbeddingBag, NOT on the compute axis at all
+#                      (a gather does no work proportional to N) — kept as the
+#                      no-pretraining floor, and the report marks it as such.
+#
+# COST, from throughput measured in the 28-cell comparison at B=256:
+#   mpnet 1386 ex/s | bert 1498 | bge-large 756 | xlm-r 890 | mistral(frozen) 192
+#   ngram ~15,000
+# At max_steps 4000 (1.02M triples per cell) that is roughly
+#   ngram 1 min | mpnet 12 | bert 11 | bge 23 | xlm-r 19
+# ~1.1 h total on one H200, plus evaluation. Raise max_steps to extend every
+# line to the right; the frontier only becomes meaningful once the lines
+# actually cross.
+#
+# e5-mistral-7b is deliberately absent. It is `frozen_only` (3B sequences per
+# step cannot be fine-tuned), so it cannot join a fine-tuning size sweep
+# without changing what the axis means: its trainable count would be its 17.8M
+# head, not 7.1B, while its forward cost stays 2NT on 7.1B. Add it as its own
+# frozen study instead, where every cell is frozen and the axis is honest:
+#   bash benchmark_scaling/run_scaling_frozen.sh
+
+run_label: scaling
+results_root: benchmark_scaling/results/chembl
+
+# --- run-level ---
+prep_max_train: 400000
+prep_max_valid: 12000
+prep_max_test: 12000
+
+encoders:
+  # The left end: same BERT family (Turc et al. 2019) at four sizes, so the
+  # axis varies size and not recipe. Without these the study spans 0.65 of a
+  # decade of compute and no slope is measurable — the 2026-08-24 run fitted
+  # C^-0.0105 at R^2=0.31, which is "no law", not "a flat law".
+  - bert-tiny            #  4.4M
+  - bert-mini            # 11.2M
+  - bert-small           # 28.8M
+  - bert-medium          # 41.4M
+  - ngram
+  - mpnet
+  - bert-multilingual
+  - bge-large
+  - xlm-roberta-large
+heads: [linear]
+freezes: ["off"]
+protocols: [pooled]
+
+# --- every cell ---
+defaults:
+  max_steps: 4000
+  batch_size: 256
+  proj_dim: 256
+
+  # 40 validation points per line. Dense on purpose: these are the scaling
+  # data points, and a sparse curve cannot show where two lines cross.
+  eval_every: 100
+  valid_loss_batches: 8
+  log_every: 50
+
+  # The fine-tuned transformers overfit; same treatment as the architecture
+  # comparison so the two studies stay comparable.
+  encoder_weight_decay: 0.01
+  head_weight_decay: 0.0
+
+  n_eval_triples: 6000
+  pool_size: 6000
+  max_filter_tails: 460000
+  max_filter_rows: 10000000
+
+cells:
+  # ngram's EmbeddingBag *is* its encoder and trains from scratch; decaying it
+  # would change the baseline rather than regularize a pretrained model.
+  ngram:
+    encoder_weight_decay: 0.0
+
+  # xlm-roberta-large is unstable at the 3e-5 default: it falls into the
+  # collapsed fixed point (all embeddings identical -> every logit equal ->
+  # loss pinned at ln(B)=5.545, gnorm ~0.003) and never escapes. Observed
+  # twice here on identical code, while a third run at the same settings
+  # trained normally and the 28-cell comparison's run also escaped — so it is
+  # a coin flip at this rate, not a deterministic misconfiguration. A scaling
+  # point sitting on the random-guess line is worse than no point, hence a
+  # gentler rate for this cell only. This is what per-cell settings are for:
+  # `--lr` would flatten every other cell onto one value.
+  xlm-roberta-large:
+    lr: 1.0e-5

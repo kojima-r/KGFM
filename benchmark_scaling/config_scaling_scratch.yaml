@@ -1,0 +1,188 @@
+# Scaling study with pretraining removed from the size axis.
+#
+# WHY A SECOND CONFIG
+# `config_scaling.yaml` sweeps pretrained encoders, which varies two things at
+# once: bigger models in the Turc et al. family were also *pretrained longer*,
+# and `bge-large` vs `bert-medium` differ in corpus and objective as well as in
+# size. An exponent fitted across that is not a statement about capacity.
+#
+# Here every cell is the same architecture family at five sizes, randomly
+# initialized (`random_init: True` -> AutoModel.from_config, no weights
+# downloaded). Size is then the only thing that varies, which is what makes the
+# fit readable as a capacity law. The price is that these models start from
+# nothing, so they need more steps and a larger learning rate than a
+# fine-tuning run does.
+#
+# SIZES (trainable parameters)
+#   scratch-tiny      4.4M
+#   scratch-mini     11.2M
+#   scratch-small    28.8M
+#   scratch-medium   41.4M
+#   scratch-base    109.5M
+#   scratch-xl      234.6M
+#   scratch-large   335.4M
+# 1.9 decades of N. Compare with the pretrained study side by side: the gap
+# between the two exponents IS the contribution of pretraining.
+#
+# READ THE REPORT ON BOTH Y-AXES. Validation loss is bounded above by ln(B) and
+# floored by repeated tails; `1 - MRR` is not, and on the 2026-08-24 run the
+# BERT family fitted b=-0.33 (R^2=0.84) there against b=-0.04 (R^2=0.66) on
+# loss. `kgfm scaling` plots and fits both.
+
+run_label: scaling_scratch
+results_root: benchmark_scaling/results/chembl
+
+# --- run-level ---
+prep_max_train: 400000
+prep_max_valid: 12000
+prep_max_test: 12000
+
+encoders:
+  - scratch-tiny
+  - scratch-mini
+  - scratch-small
+  - scratch-medium
+  - scratch-base
+  # 16x1024 / 234M — 2.1x BERT-base. Added when bert-large's own 24x1024 /
+  # 335M appeared not to fit; it does (see scratch-large below), so this is an
+  # interior point of the axis rather than a substitute for one. It is also the
+  # cell that wins on MRR: 0.5142 in-loop / 0.4979 on the final test, better
+  # than both 109M and 335M.
+  - scratch-xl
+  # 24x1024 / 335M, the top of the axis on one H200. This cell used to be
+  # impossible: it trained at B=256 and then OOMed in the first in-loop
+  # evaluation. That was not a size limit -- TransformerEncoder.forward forced
+  # torch.enable_grad() over the ambient no_grad, so every evaluation built a
+  # training-sized graph it never used. With that fixed the cell runs end to
+  # end and the binding constraint moved back to training: measured at B=256,
+  # train_peak 101.81 GiB against eval_peak 7.98 of 139.8.
+  - scratch-large
+heads: [linear]
+freezes: ["off"]
+protocols: [pooled]
+
+# --- every cell ---
+defaults:
+  # 12x config_scaling.yaml's budget. A randomly initialized model spends its
+  # first few thousand steps learning what the pretrained ones already knew, so
+  # a 4000-step window would put every size in that transient and compare
+  # warm-up speeds rather than capacity.
+  #
+  # Raised from 16000 after the 2026-08-26 run, where the two largest cells
+  # were still improving when the budget ran out: `scratch-medium` reached its
+  # best validation loss at step 15,750 of 16,000 and `scratch-base` at 16,000
+  # exactly — i.e. at the last measurement, so both numbers were LOWER BOUNDS,
+  # not optima. The small cells were long since past their best (tiny bottomed
+  # at 1,500), so the budget was binding only at the top of the size axis —
+  # which biases the fitted exponent flat, because the largest models are the
+  # ones being cut short.
+  #
+  # STILL BINDING at 48000, measured on the 7-cell run: best valid loss lands
+  # at step 45,500 (mini) / 41,750 (small) / 42,750 (medium) / 47,500 (base) /
+  # 47,500 (large) of 48,000. Only scratch-xl (37,250) and scratch-tiny
+  # (28,250) have interior minima, so five of seven "best" numbers are lower
+  # bounds and the flat-exponent bias above has not been removed, only moved
+  # up the size axis. Raising this again is the next lever if the exponent
+  # matters more than wall clock (scratch-large alone is 8.5 h at 48k).
+  max_steps: 48000
+  batch_size: 256
+  proj_dim: 256
+
+  # These ARE the scaling data points, so they are dense on purpose. Kept at
+  # 250 rather than scaled with max_steps: an eval costs ~4s against ~150s of
+  # training per 250 steps, so density here is nearly free, and the mid-run
+  # non-monotonicity documented below is only visible at this resolution.
+  eval_every: 250
+  # 8 batches at B=256 is 2,048 rows per measurement, and `best valid loss` is
+  # the MINIMUM over 192 such measurements -- so it is a min-of-192 on a noisy
+  # statistic and is biased downward by however much a cell happens to wobble.
+  # Measured on the 7-cell run, the last five points of the two best cells:
+  #   scratch-base  2.8260 2.8138 [2.7577] 2.8088 2.7924
+  #   scratch-large 3.0227 3.0231 [2.9485] 3.0356 2.9952
+  # The bracketed headline numbers are noise dips on a plateau, not the end of
+  # a trend. Differences around 0.05 nats are therefore NOT resolvable here.
+  # Raise this (or compare a late-run mean instead of the min) before ranking
+  # cells that land this close; it is cheap, an eval costs ~4 s against ~150 s
+  # of training per 250 steps.
+  valid_loss_batches: 8
+  log_every: 100
+
+  # No pretrained weights to preserve, so there is nothing for weight decay to
+  # protect here; it is kept nonzero only to match the pretrained study, which
+  # is the run this one is meant to be compared against.
+  encoder_weight_decay: 0.01
+  head_weight_decay: 0.0
+
+  n_eval_triples: 6000
+  pool_size: 6000
+  max_filter_tails: 460000
+  max_filter_rows: 10000000
+
+# Per-size learning rates, MEASURED, not assumed. `benchmark_scaling/
+# run_lr_probe.sh` + `run_lr_probe_extend.sh` swept 3e-6 … 3e-3 at these exact
+# cell settings (2000 steps, B=256); every value below is an interior optimum,
+# not a grid edge. Selected on validation loss — a rate is tuned against what
+# the optimizer minimizes; the probe's MRR column is a cross-check only.
+#
+# Best validation loss per (size, rate). `collapse` = within 0.5% of
+# ln(256)=5.5452, i.e. the model never left the random-guess fixed point:
+#
+#                 3e-6    1e-5    3e-5    1e-4    3e-4    1e-3    3e-3
+#   tiny            --   3.7627  3.3230 [3.1892] 3.2286  3.6682   coll
+#   mini            --   3.4016 [3.1677] 3.2167  3.3257   coll     coll
+#   small        3.5940 [3.2068] 3.2117  3.5207   coll    coll     coll
+#   medium          --   3.1837 [3.1714] 3.2959   coll    coll     coll
+#   base         3.2942 [3.1200] 3.3400   coll    coll    coll     coll
+#   xl           3.2386 [3.1995]  coll    coll    coll    coll     coll
+#   large*      [3.2652] 3.3188   coll    coll    coll    coll     coll
+#
+#   * scratch-large was swept on its own grid (1e-6 3.5462, 3e-6 3.2652,
+#     1e-5 3.3188, 3e-5 collapse), so its 3e-6 column has no counterpart
+#     above; the value is interior on that grid, and loss and MRR agree
+#     on it (MRR 0.3331 / 0.4204 / 0.4019 / collapse).
+#
+# WHY THIS MATTERS MORE THAN A USUAL HYPERPARAMETER TABLE. `train.SCRATCH_LR`
+# is 1e-4, and at 1e-4 `scratch-base` **collapses outright** while
+# `scratch-small` lands 0.31 nats off its own optimum. Run on the single
+# default, this study's largest cell would have sat on the random-guess line
+# and the size axis would have reported "capacity does not help" — the flat
+# exponent would have been an artifact of the learning rate, not a measurement.
+# At its own rate `scratch-base` is instead the *best* cell in the sweep
+# (3.1200, better than every smaller size), which is what the size axis is
+# supposed to show.
+#
+# The tolerated rate falls with size but not smoothly: small and medium share
+# a collapse threshold, and medium trains better at it (3.1714 vs 3.2068) —
+# they differ mostly in depth (8x512 vs 4x512), not parameter count.
+#
+# DO NOT ADD EARLY STOPPING HERE. Measured on the 2026-08-26 run: validation
+# loss for the two largest cells is *two-phase* — it falls, rises for several
+# thousand steps, then falls again to a much better minimum. medium's best in
+# the first quarter of the run is 3.1430 against 3.0087 later; base's is 3.1305
+# against 3.0018. Patience-based stopping at 4, 8 or 16 evaluations all fire
+# during the rise and truncate both cells ~0.13 nats short — seven times the
+# entire spread of the three 4-layer cells, enough to erase "the largest model
+# is best" and flatten the size axis exactly as a wrong learning rate would.
+cells:
+  scratch-tiny:
+    lr: 1.0e-4
+  scratch-mini:
+    lr: 3.0e-5
+  scratch-small:
+    lr: 1.0e-5
+  scratch-medium:
+    lr: 3.0e-5
+  scratch-base:
+    lr: 1.0e-5
+  # Interior optimum, same grid as the others: 3e-6 -> 3.2386,
+  # 1e-5 -> 3.1995, 3e-5 -> collapse (ln(256)=5.5452).
+  scratch-xl:
+    lr: 1.0e-5
+  # Interior on its own grid: 1e-6 -> 3.5462, 3e-6 -> 3.2652, 1e-5 -> 3.3188,
+  # 3e-5 -> collapse. Note this cell's best-at-2000-steps (3.2652) is WORSE
+  # than scratch-base's (3.1200) and scratch-xl's (3.1995). That is what a
+  # short probe looks like from random init -- a bigger model spends more of
+  # 2000 steps in its transient -- and is exactly why the probe is a bracket
+  # for the rate, not a ranking of the sizes. The 48k-step run is the ranking.
+  scratch-large:
+    lr: 3.0e-6

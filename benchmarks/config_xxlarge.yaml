@@ -1,0 +1,139 @@
+# Full-corpus scale — one complete pass over everything in list_chembl/train.txt,
+# with the architecture that actually won the comparison.
+#
+# Every other config trains on a *slice*: `StreamingTripleDataset` reads each
+# TSV to its end before opening the next, so a 25k-step run at B=256 pulls only
+# a few million rows per dataloader worker and never finishes one file. At
+# num_workers=4 that is ~4 of the 85 train files. This config is the opposite
+# end: `max_epoch: 1.0` runs until the loader is exhausted, i.e. every row is
+# seen exactly once.
+#
+# WHY gte-large + mlp + fine-tune
+# The 28-cell sweep in config_xlarge_compare.yaml (2026-08-11, 6000 steps each,
+# identical B and proj_dim) ranked as follows on the filtered protocol:
+#     0.4641  gte-large          mlp     fine-tune   <- this config
+#     0.4538  bert-multilingual  linear  fine-tune
+#     0.4413  bert-multilingual  mlp     fine-tune
+#     0.4364  e5-large           mlp     fine-tune
+#     0.4331  ngram              linear  fine-tune
+# The #1-#5 gap is 0.031, about 8x the eval's sampling SE (0.0041 at n=12032),
+# so the top of that list is not noise. It is still ONE seed per cell, and
+# neighbouring cells are only a few SE apart — gte-large is the best measured
+# choice, not a proven one. Note also that `mlp` beat `linear` by 0.037 for this
+# encoder while `linear` beat `mlp` for bert-multilingual: the head interacts
+# with the encoder rather than being uniformly better, which is why the head is
+# pinned here rather than left at the default.
+#
+# MEASURED SIZE OF THE CORPUS (wc -l over every file in the lists, not an
+# estimate; `_iter_tsv_rows` drops nothing here — the keep rate is 1.0000):
+#   train   85 files   674,265,105 rows   105.35 GiB
+#   valid    6 files    25,764,240 rows     3.99 GiB
+#   test     4 files    40,000,000 rows     6.36 GiB
+# The files are NOT uniform: the largest is 1.81 GB and the smallest 39 KB, so
+# "85 x 10M" is wrong by 26% — hence the exact count above.
+#
+# ONE EPOCH is declared as `max_epoch: 1.0` rather than as a step count. kgfm
+# counts the rows itself (cached after the first ~5 min pass over 105 GiB) and
+# works out
+#     steps = ceil(max_epoch * 674,265,105 / (batch_size * nproc * accum))
+#          = 2,633,849  at B=256 on one GPU
+# which is why the two-GPU footgun below is now handled for you: `nproc` is in
+# the divisor, so `--nproc 2` gives 1,316,925 steps per rank and is still
+# exactly one epoch.
+#
+# WALL CLOCK, measured (all figures are GLOBAL examples/s, i.e. summed over
+# ranks — the log's `rate=` is log_every * global_bs / dt):
+#     1 GPU                   751 ex/s   ->  249 h = 10.4 days
+#     2 GPUs, gradients synced 957 ex/s   ->  196 h =  8.2 days
+# A second GPU is worth about 1.27x here, NOT 2x. The all-reduce is 1.34 GB per
+# step for this 336M-parameter encoder while the step itself is only 512 short
+# sequences of compute, so synchronisation eats most of the second card. Do not
+# be misled by the 1,990 ex/s that the 2026-08-13 run reported: that run had a
+# DDP bug and was not synchronising gradients at all, which is exactly why it
+# looked twice as fast and why its results were unusable.
+# For a same-day full pass instead, `--encoders ngram --heads linear
+# --batch-size 512` is ~11 h (5th place, MRR 0.4331) — and needs no step count,
+# because max_epoch re-derives it from the larger batch.
+#
+# A second GPU halves the wall clock here rather than doubling the data, because
+# train files are sharded `files[rank::world_size]` and each rank reads a
+# disjoint half. With `max_epoch` there is nothing to adjust by hand. Note the
+# global batch is then 512 (2 x 256) with the gradient averaged across ranks,
+# while the in-batch negative count stays 255 per rank — so a 2-GPU run is a
+# larger-effective-batch run, not a step-for-step replica of the 1-GPU one.
+#
+# WHY A FULL EPOCH SHOULD SUIT A FINE-TUNED TRANSFORMER
+# In the 25k-step large run the fine-tuned transformer was the cell that
+# diverged: train loss kept falling while valid loss bottomed at step 12.5k and
+# rose. That was never memorization of repeated rows — at <0.05 epochs no row is
+# ever seen twice — it was population shift, the model fitting the handful of
+# train files it had reached. A full epoch reaches all 85, which is the direct
+# fix for that failure mode rather than a workaround for it.
+
+run_label: chembl_xxlarge
+
+# --- run-level ---
+
+# These cap the entity-ID KG that `prep` builds for ULTRA / MOTIF. They do NOT
+# limit kgfm's own training, which streams the raw TSVs listed above regardless.
+# Left at the xlarge values on purpose: streaming 674M rows into a text KG would
+# produce a ~100 GB file that neither baseline can load, and the baselines are
+# not what this config is for.
+prep_max_train: 400000
+prep_max_valid: 12000
+prep_max_test: 12000
+
+# The winner of the 28-cell sweep. Adding `ngram` costs +11 h (+4% of this run)
+# and gives the report a no-pretraining baseline row in the same directory —
+# worth it if you want the comparison, but it is not the default because this
+# config is about one architecture at full data.
+encoders: [gte-large]
+heads: [mlp]
+freezes: ["off"]
+protocols: [pooled, filtered]
+
+# --- every cell ---
+defaults:
+  # Exactly one pass over list_chembl/train.txt. Fractional values work too
+  # (0.25 for a quarter of the corpus). This replaces max_steps: stating the
+  # step count by hand means recomputing it whenever batch_size or nproc
+  # changes, and getting it wrong silently trains the wrong amount of data.
+  max_epoch: 1.0
+
+  # 256 is forced, not chosen: gte-large fine-tuning OOMs at 384 and 512 on a
+  # 143 GiB H200 (verified with the real cell — see config_xlarge_compare.yaml).
+  # It is also the batch the 0.4641 result was obtained at, so keeping it means
+  # this run differs from that cell in data volume alone.
+  batch_size: 256
+
+  # Must stay unset: this is what makes the run read each file to its end.
+  # Setting it would cap rows per file and silently stop this being a full pass.
+  max_rows_per_file: null
+
+  proj_dim: 256
+
+  # Same regularization the 0.4641 cell used.
+  encoder_weight_decay: 0.01
+  head_weight_decay: 0.0
+
+  # 50 (the default) would put ~53,000 points into the report's training curve.
+  # 2000 keeps it at ~1,300, still far more resolution than the 10 validation
+  # points it is plotted against.
+  log_every: 2000
+
+  # 1000 (the default) would rewrite a ~4 GB checkpoint 2,634 times over this
+  # run. Every 20k steps is 131 snapshots, so --resume loses at most ~1.9 h.
+  ckpt_every: 20000
+
+  n_eval_triples: 12000
+  pool_size: 12000
+
+  # NOT |E| at this scale. |E| for the full corpus has never been measured here
+  # (it needs a prep pass over 674M rows) and is far beyond what the filtered
+  # protocol can encode — the pass would have to embed every entity string.
+  # This is a bound chosen so the eval finishes, which makes the filtered
+  # numbers OPTIMISTIC and *not* comparable to the large / xlarge / compare
+  # runs, whose max_filter_tails really was ~|E|. Compare within this config
+  # only — in particular this run's MRR is not comparable to the 0.4641 above.
+  max_filter_tails: 2000000
+  max_filter_rows: 10000000
