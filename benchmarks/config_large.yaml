@@ -3,8 +3,8 @@
 # kgfm 2.3 h).
 #
 # Publication-grade choices, following the guidance in README.md:
-#   max_test >= 10,000        so the MRR standard error is ~+-0.004
-#   n_eval_triples = max_test so kgfm evaluates the same triples as the baselines
+#   prep_max_test >= 10,000   so the MRR standard error is ~+-0.004
+#   n_eval_triples = prep_max_test  so kgfm evaluates as many triples as the KG
 #   max_filter_tails ~= |E|   so filtered ranking is against the real vocabulary
 #   freezes: [off, on]        fine-tuned vs frozen-encoder ablation
 #
@@ -31,9 +31,9 @@ run_label: chembl_large
 # --- run-level ---
 
 # |E| ~ 280,000 at this cap
-max_train: 250000
-max_valid: 10000
-max_test: 10000
+prep_max_train: 250000
+prep_max_valid: 10000
+prep_max_test: 10000
 
 encoders: [ngram, transformer]
 # "on" adds a frozen-encoder cell (projection head only) — the ablation that

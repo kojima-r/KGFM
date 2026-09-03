@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import math
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import List, Optional
 
 import torch
@@ -26,12 +28,18 @@ from torch.utils.data import DataLoader
 
 from .data import (
     StreamingTripleDataset,
+    epoch_examples,
     collate_triples,
     discover_tsv_files,
     read_file_list,
     split_files_three_way,
 )
-from .encoders import ENCODER_PRESETS, is_transformer, make_encoder
+from .encoders import (
+    ENCODER_PRESETS,
+    is_random_init,
+    is_transformer,
+    make_encoder,
+)
 from .eval import evaluate
 from .losses import (
     DEFAULT_LOSS,
@@ -86,12 +94,30 @@ class TrainConfig:
     shuffle_buffer: int = 16384
     row_keep_prob: float = 1.0
     max_rows_per_file: Optional[int] = None
+    # Round-robin over the worker's files instead of reading each to its end.
+    # See StreamingTripleDataset: concatenation makes the stream a sequence of
+    # distinct distributions, and the model specialises to whichever it is in.
+    interleave_files: bool = True
+    # Shuffle the stream the validation loss is measured on; see make_loader.
+    valid_loss_shuffle: bool = True
     # Distributed
     # Backend for torch.distributed when launched via torchrun. "nccl" is
     # used on CUDA, "gloo" otherwise. Only consulted when WORLD_SIZE>1.
     dist_backend: str = "nccl"
+    # NCCL's watchdog aborts a collective that stalls this long. The default
+    # (10 min) is far too short here: evaluation and checkpoint writing happen
+    # on rank 0 only, with the other ranks parked in `barrier()` for the whole
+    # of it, and a filtered eval over a large tail vocabulary legitimately runs
+    # longer than that. Too small a value turns a slow eval into a crash.
+    dist_timeout_min: int = 120
     # Optim
     max_steps: int = 5000
+    # Alternative to max_steps: train for this many passes over the data
+    # (fractional allowed). When set it *overrides* max_steps, because the
+    # step count that means "one epoch" depends on the batch size and the GPU
+    # count and is not something to keep in sync by hand. See
+    # `resolve_max_steps`.
+    max_epoch: Optional[float] = None
     log_every: int = 50
     eval_every: int = 1000
     eval_pool_size: int = 2000
@@ -156,6 +182,12 @@ class TrainConfig:
 # unrelated texts) and the loss moved less than 1e-3 over 200 steps.
 NGRAM_LR = 1e-3
 TRANSFORMER_LR = 3e-5          # standard BERT fine-tuning range is 2e-5..5e-5
+# A randomly initialised encoder is not being fine-tuned, it is being trained.
+# 3e-5 is a rate chosen to avoid disturbing pretrained weights and is far too
+# small to learn from scratch in a reasonable number of steps. This is only a
+# starting point — a scaling study should sweep the rate per model size, which
+# is what `cells: <tag>: lr:` is for.
+SCRATCH_LR = 1e-4
 
 
 def default_lr(encoder: str, freeze_encoder: bool = False) -> float:
@@ -165,16 +197,65 @@ def default_lr(encoder: str, freeze_encoder: bool = False) -> float:
     from-scratch layer — so it takes the large rate, not the fine-tuning one.
     """
     if is_transformer(encoder) and not freeze_encoder:
-        return TRANSFORMER_LR
+        return SCRATCH_LR if is_random_init(encoder) else TRANSFORMER_LR
     return NGRAM_LR
 
 
-def make_loader(files, cfg: TrainConfig, *, train: bool) -> DataLoader:
+def resolve_max_steps(
+    cfg: TrainConfig,
+    files: List[str],
+    *,
+    world_size: int = 1,
+    per_device_bs: Optional[int] = None,
+    accum_steps: Optional[int] = None,
+) -> int:
+    """`max_steps`, or the step count that `max_epoch` works out to.
+
+    An optimizer step consumes ``per_device_bs * accum_steps`` examples on each
+    of ``world_size`` ranks, so
+
+        steps = ceil(max_epoch * epoch_examples / (world * per_device * accum))
+
+    ``files`` must be the **unsharded** train list. Each rank reads only
+    ``files[rank::world_size]`` and those shards are not equal in size (ChEMBL's
+    largest file is 1.81 GB and its smallest 39 KB), but every rank has to run
+    the same number of steps or the collective ops deadlock — so the epoch is
+    divided evenly rather than measured per shard.
+    """
+    if cfg.max_epoch is None:
+        return int(cfg.max_steps)
+    if cfg.max_epoch <= 0:
+        raise SystemExit(f"--max-epoch must be positive (got {cfg.max_epoch})")
+    per_device = per_device_bs or _resolve_per_device_batch_size(cfg)
+    accum = accum_steps or max(1, int(cfg.gradient_accumulation_steps))
+    total = epoch_examples(
+        files,
+        max_rows_per_file=cfg.max_rows_per_file,
+        row_keep_prob=cfg.row_keep_prob,
+    )
+    per_step = per_device * max(1, world_size) * accum
+    return max(1, math.ceil(cfg.max_epoch * total / per_step))
+
+
+def make_loader(files, cfg: TrainConfig, *, train: bool,
+                shuffle: Optional[bool] = None) -> DataLoader:
+    """Loader over ``files``. ``shuffle`` defaults to ``train``.
+
+    It is separate from ``train`` because the validation *loss* wants shuffling
+    without the training-side row subsampling: unshuffled, its in-batch
+    negatives are consecutive rows of one activity block, i.e. near-duplicates
+    no model can separate, which puts a floor under the number and compresses
+    the differences between models. Measured on one checkpoint: 4.73
+    unshuffled versus 4.35 shuffled.
+    """
+    if shuffle is None:
+        shuffle = train
     ds = StreamingTripleDataset(
         files=files,
-        shuffle_files=train,
-        shuffle_buffer=cfg.shuffle_buffer if train else 1,
+        shuffle_files=shuffle,
+        shuffle_buffer=cfg.shuffle_buffer if shuffle else 1,
         row_keep_prob=cfg.row_keep_prob if train else 1.0,
+        interleave_files=cfg.interleave_files,
         max_text_len=cfg.max_text_len,
         seed=cfg.seed,
         max_rows_per_file=cfg.max_rows_per_file,
@@ -207,13 +288,19 @@ def in_batch_negative_loss(
     tails are the negatives, so B sets the negative count. Which objective is
     applied to that score matrix is `kgfm/losses.py`'s business.
 
-    Accepts either a raw DistMultScorer or a DDP-wrapped one — we always
-    encode through the underlying module. DDP's gradient all-reduce is
-    registered on the parameters themselves, so backward still syncs
-    correctly even though we bypass DDP.forward.
+    Accepts either a raw DistMultScorer or a DDP-wrapped one, and **calls it**
+    rather than reaching for `.module`. That is load-bearing under DDP: the
+    gradient all-reduce is armed by `reducer.prepare_for_backward()`, which
+    only runs inside `DistributedDataParallel.forward`. An earlier version
+    encoded through the inner module on the assumption that the parameter
+    hooks were enough; they are not, and the result was that each rank trained
+    its own model with no synchronisation whatsoever — measured directly, two
+    ranks ended five steps with completely different weights. It also made the
+    ranks free-running, so they drifted apart until the first eval barrier
+    exceeded NCCL's 600 s watchdog and aborted a 9-hour run.
     """
-    inner: DistMultScorer = scorer.module if hasattr(scorer, "module") else scorer
-    h, r, t = inner.encode_triple(batch["h_text"], batch["r_text"], batch["t_text"])
+    h, r, t = scorer(batch["h_text"], batch["r_text"], batch["t_text"],
+                     return_embeddings=True)
     h, r, t = h.to(device), r.to(device), t.to(device)
     fn_mask = (
         duplicate_tail_mask(batch["t_text"], device)
@@ -301,22 +388,32 @@ def evaluate_loss(
     if not files or n_batches <= 0:
         return None
     loader_cfg = TrainConfig(**{**cfg.__dict__, "batch_size": batch_size})
-    loader = make_loader(files, loader_cfg, train=False)
+    loader = make_loader(files, loader_cfg, train=False,
+                         shuffle=cfg.valid_loss_shuffle)
     was_training = scorer.training
     scorer.eval()
     total, seen = 0.0, 0
     try:
-        for batch in loader:
-            # A short tail batch would be scored against fewer negatives, so
-            # skip it rather than average an incomparable number in.
-            if len(batch["h_text"]) < batch_size:
-                continue
-            total += float(
-                in_batch_negative_loss(scorer, batch, device, **loss_kwargs(cfg))
-            )
-            seen += 1
-            if seen >= n_batches:
-                break
+        # no_grad, not just eval(): `scorer.eval()` only switches dropout and
+        # norm layers, it does not stop autograd from recording. Without this
+        # every validation pass built a full training-sized graph (B rows is
+        # 3B sequences through encode_triple) and discarded it unused — pure
+        # waste on every cell, and enough to OOM the largest models at the
+        # evaluation step while training itself fit comfortably. `evaluate()`
+        # has carried the decorator all along; this path was missed.
+        with torch.no_grad():
+            for batch in loader:
+                # A short tail batch would be scored against fewer negatives,
+                # so skip it rather than average an incomparable number in.
+                if len(batch["h_text"]) < batch_size:
+                    continue
+                total += float(
+                    in_batch_negative_loss(scorer, batch, device,
+                                           **loss_kwargs(cfg))
+                )
+                seen += 1
+                if seen >= n_batches:
+                    break
     finally:
         if was_training:
             scorer.train()
@@ -403,7 +500,10 @@ def _init_distributed(cfg: TrainConfig) -> _DistState:
         backend = "gloo"
 
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend)
+        dist.init_process_group(
+            backend=backend,
+            timeout=timedelta(minutes=max(1, int(cfg.dist_timeout_min))),
+        )
 
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -463,6 +563,15 @@ def train(cfg: TrainConfig) -> None:
     )
 
     train_files, valid_files, test_files = resolve_splits(cfg)
+    if cfg.max_epoch is not None:
+        # Counted before sharding, and identical on every rank.
+        steps = resolve_max_steps(
+            cfg, train_files, world_size=ds.world_size,
+            per_device_bs=per_device_bs, accum_steps=accum_steps,
+        )
+        mprint(f"[init] max_epoch={cfg.max_epoch:g} -> max_steps={steps:,} "
+               f"({steps * global_bs:,} examples over {len(train_files)} files)")
+        cfg.max_steps = steps
     if ds.world_size > 1:
         # Shard train files across ranks. Slicing by rank::world_size keeps
         # the count balanced and the global ordering deterministic. Eval
@@ -649,13 +758,20 @@ def train(cfg: TrainConfig) -> None:
                 running = 0.0
                 # Throughput counts global examples seen since last log.
                 ex = cfg.log_every * global_bs
+                # Cumulative padded tokens through the encoder, per rank.
+                # Measured rather than derived from batch_size x seq_len,
+                # because `padding=True` makes the real length batch-dependent
+                # and padding is what the GPU actually pays for. Consumed by
+                # kgfm/scaling to turn steps into FLOPs.
+                tokens = int(getattr(scorer_raw.encoder, "tokens_seen", 0))
+                tok_str = f"  tokens={tokens}" if tokens else ""
                 gnorm_str = ""
                 if gnorm_count:
                     gnorm_str = f"  gnorm={running_gnorm / gnorm_count:.4f}"
                     running_gnorm, gnorm_count = 0.0, 0
                 mprint(
                     f"[step {step:>6d}] loss={avg:.4f}  "
-                    f"rate={ex/dt:.0f} ex/s{gnorm_str}",
+                    f"rate={ex/dt:.0f} ex/s{gnorm_str}{tok_str}",
                     flush=True,
                 )
                 t0 = time.time()
@@ -663,6 +779,24 @@ def train(cfg: TrainConfig) -> None:
             if step % cfg.eval_every == 0 and eval_target_files:
                 barrier()
                 if ds.is_main:
+                    # Peak *allocated* across the evaluation, measured from the
+                    # training state it lands on top of. This is the sizing
+                    # signal for a new cell: nvidia-smi reports the caching
+                    # allocator's reserved pool, which grows to fill the card,
+                    # so a cell reads as 137 of 143 GiB while fitting fine and
+                    # equally while on its way to OOM. Evaluation is the
+                    # binding constraint, not training, so it is measured here.
+                    mem = torch.cuda.is_available() and device.type == "cuda"
+                    if mem:
+                        # Peak since the last eval, i.e. across the training
+                        # steps in between: the forward+backward activations,
+                        # which are freed again before we get here. Reading
+                        # only `memory_allocated` here would report the
+                        # post-step residue (params + Adam moments) and miss
+                        # the number that actually sizes the cell.
+                        train_peak = torch.cuda.max_memory_allocated(device)
+                        train_alloc = torch.cuda.memory_allocated(device)
+                        torch.cuda.reset_peak_memory_stats(device)
                     metrics = evaluate(
                         scorer_raw,
                         eval_target_files,
@@ -682,6 +816,30 @@ def train(cfg: TrainConfig) -> None:
                     if vloss is not None:
                         metrics["loss"] = vloss
                     print(f"[{eval_label} eval @ step {step}] {metrics}", flush=True)
+                    if mem:
+                        gib = 1024 ** 3
+                        # `driver` is what actually runs out, but it is not a
+                        # sizing signal on its own: it reports the allocator's
+                        # cached pool, which the allocator flushes only under
+                        # pressure. Measured on scratch-large at B=256, two
+                        # consecutive evals of the *same* run read
+                        # driver=10.34 then 115.94 GiB (a flush happened in
+                        # between) while `train_peak` was 101.81 GiB both
+                        # times. nvidia-smi shows this same number, which is
+                        # why polling it answers a different question
+                        # depending on when you poll.
+                        free, total = torch.cuda.mem_get_info(device)
+                        # Own line, not appended to the eval line: report.py's
+                        # _EVAL_RE parses that one back out of the log.
+                        print(
+                            f"[mem @ step {step}] train_peak="
+                            f"{train_peak / gib:.2f}GiB train_alloc="
+                            f"{train_alloc / gib:.2f}GiB eval_peak="
+                            f"{torch.cuda.max_memory_allocated(device) / gib:.2f}GiB "
+                            f"reserved={torch.cuda.memory_reserved(device) / gib:.2f}GiB "
+                            f"driver={(total - free) / gib:.2f}/{total / gib:.2f}GiB",
+                            flush=True,
+                        )
                     if metrics.get("MRR", 0.0) > best_mrr:
                         best_mrr = metrics["MRR"]
                         save_checkpoint(scorer_raw, cfg, step, tag="best",
@@ -794,7 +952,10 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--n-buckets", type=int, default=10)
     # Encoder
     p.add_argument("--encoder", default="ngram",
-                   choices=["ngram", "transformer", "bert", "hf"])
+                   choices=["ngram", "transformer", "bert", "hf"]
+                           + sorted(ENCODER_PRESETS),
+                   help="'ngram', 'transformer' (+ --transformer-model), or a "
+                        "named preset from kgfm/encoders.py.")
     p.add_argument("--vocab-size", type=int, default=1 << 20)
     p.add_argument("--embedding-dim", type=int, default=256)
     p.add_argument("--n-min", type=int, default=3)
@@ -806,8 +967,13 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--freeze-encoder", action="store_true",
                    help="Freeze the LM and only train the projection head + r-bias.")
     p.add_argument("--proj-dim", type=int, default=None,
-                   help="If set, add a Linear projection from encoder.embedding_dim "
-                        "to proj_dim before scoring (recommended with frozen BERT).")
+                   help="If set, project from encoder.embedding_dim to proj_dim "
+                        "before scoring (recommended with a frozen encoder).")
+    p.add_argument("--head", default=DEFAULT_HEAD, choices=list(HEADS),
+                   help=f"Projection head between encoder and score "
+                        f"(default: {DEFAULT_HEAD}, which is Identity when "
+                        f"--proj-dim matches the encoder width and Linear "
+                        f"otherwise). See kgfm/heads.py.")
     # Loader
     p.add_argument("--max-text-len", type=int, default=512)
     p.add_argument("--batch-size", type=int, default=256,
@@ -835,8 +1001,34 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--shuffle-buffer", type=int, default=16384)
     p.add_argument("--row-keep-prob", type=float, default=1.0)
     p.add_argument("--max-rows-per-file", type=int, default=None)
+    p.add_argument("--no-interleave-files", dest="interleave_files",
+                   action="store_false", default=True,
+                   help="Read each TSV to its end before opening the next, "
+                        "instead of round-robin across them. The default "
+                        "interleaves because a ChEMBL file is an entity "
+                        "population: read sequentially the stream is a "
+                        "sequence of distributions rather than one. Only for "
+                        "reproducing pre-2026-08-25 runs.")
+    p.add_argument("--no-valid-loss-shuffle", dest="valid_loss_shuffle",
+                   action="store_false", default=True,
+                   help="Measure the validation loss on the unshuffled "
+                        "stream, whose in-batch negatives are whichever rows "
+                        "happen to sit next to each other. Only for "
+                        "reproducing older numbers.")
     # Optim
     p.add_argument("--max-steps", type=int, default=5000)
+    p.add_argument("--dist-timeout-min", type=int, default=120,
+                   help="Minutes before NCCL's watchdog aborts a stalled "
+                        "collective. Must exceed the longest rank-0-only "
+                        "phase (evaluation, checkpoint writing), during which "
+                        "the other ranks sit in a barrier.")
+    p.add_argument("--max-epoch", type=float, default=None,
+                   help="Train for this many passes over the data instead of a "
+                        "fixed step count; fractional values are allowed "
+                        "(0.5 = half the corpus). Overrides --max-steps, and "
+                        "adjusts automatically for batch size and GPU count. "
+                        "The first use counts the rows (~1 min for 105 GiB) "
+                        "and caches them.")
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--eval-pool-size", type=int, default=2000)
@@ -944,7 +1136,11 @@ def config_from_args(a: argparse.Namespace) -> TrainConfig:
         shuffle_buffer=a.shuffle_buffer,
         row_keep_prob=a.row_keep_prob,
         max_rows_per_file=a.max_rows_per_file,
+        interleave_files=a.interleave_files,
+        valid_loss_shuffle=a.valid_loss_shuffle,
         max_steps=a.max_steps,
+        max_epoch=a.max_epoch,
+        dist_timeout_min=a.dist_timeout_min,
         log_every=a.log_every,
         eval_every=a.eval_every,
         eval_pool_size=a.eval_pool_size,

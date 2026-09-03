@@ -17,7 +17,7 @@ things:
 
 ::
 
-    max_train: 250000          # run-level
+    prep_max_train: 250000     # run-level
     encoders: [ngram, transformer]
 
     defaults:                  # every cell
@@ -51,7 +51,7 @@ STEPS = ("prep", "sweep", "viz")
 # Everything not listed here is run-level and may only appear at the top of a
 # config file. Keep in sync with the `_add_*` groups in bench/cli.py.
 CELL_FIELDS = frozenset({
-    "max_steps", "batch_size", "proj_dim",
+    "max_steps", "max_epoch", "batch_size", "proj_dim",
     "per_device_train_batch_size", "per_device_eval_batch_size",
     "gradient_accumulation_steps",
     "log_every", "eval_every", "valid_loss_batches",
@@ -59,8 +59,16 @@ CELL_FIELDS = frozenset({
     "weight_decay", "encoder_weight_decay", "head_weight_decay",
     "encoder_dropout", "head_dropout", "mask_duplicate_tails",
     "n_eval_triples", "pool_size", "max_filter_tails", "max_filter_rows",
-    "max_rows_per_file",
+    "max_rows_per_file", "ckpt_every",
+    "interleave_files", "valid_loss_shuffle",
 })
+# Renamed settings, kept only to turn a stale config into a clear error.
+_RENAMED = {
+    "max_train": "prep_max_train",
+    "max_valid": "prep_max_valid",
+    "max_test": "prep_max_test",
+}
+
 PROTOCOLS = ("pooled", "filtered")
 FREEZES = ("off", "on")
 
@@ -86,13 +94,20 @@ class BenchConfig:
     kg_dir: str = "benchmarks/chembl_kg"
     run_label: str = ""
 
-    # --- data caps for the prepared entity-ID KG ---
+    # --- data ---
     train_list: str = "list_chembl/train.txt"
     valid_list: str = "list_chembl/valid.txt"
     test_list: str = "list_chembl/test.txt"
-    max_train: int = 50_000
-    max_valid: int = 2_000
-    max_test: int = 2_000
+    # Row caps for `kgfm bench prep`, which turns the raw TSVs into the
+    # entity-ID KG that ULTRA and MOTIF consume. They do **not** limit kgfm's
+    # own training or evaluation: kgfm streams the TSVs in the lists above
+    # directly and never reads the prepared KG. The `prep_` prefix is there so
+    # that is obvious from the name — an earlier `max_train` read like a cap on
+    # the whole run. Both baselines read the *same* prepared KG, which is why
+    # there is one set of caps rather than one per baseline.
+    prep_max_train: int = 50_000
+    prep_max_valid: int = 2_000
+    prep_max_test: int = 2_000
     strict_transductive: bool = False
     seed: int = 0
 
@@ -110,6 +125,11 @@ class BenchConfig:
     # encode_triple bundles h+r+t into a single 3B-sequence encoder forward —
     # that is now `cells: transformer: batch_size:`, not a special field.
     max_steps: int = 200
+    # Passes over the train data instead of a step count (fractional allowed).
+    # Resolved to steps here rather than in the cell, because the derived
+    # eval/log cadences below are computed from max_steps and the cell only
+    # ever receives the resolved number.
+    max_epoch: Optional[float] = None
     batch_size: int = 256
     # Required whenever `freezes` contains "on": with a frozen encoder and no
     # projection the model has zero trainable parameters.
@@ -145,6 +165,15 @@ class BenchConfig:
     # only pulls 3.2M rows per worker. So the default touches ~4 files of 85
     # (one per worker, 32% in). Setting this trades depth for breadth.
     max_rows_per_file: Optional[int] = None
+    # Steps between `last.pt` rewrites. None = kgfm.train's 1000, which is far
+    # too often for a million-step run (each rewrite is the whole model plus
+    # optimizer state).
+    ckpt_every: Optional[int] = None
+    # Data ordering and validation-loss measurement; see kgfm/data.py and
+    # train.make_loader. Both default to the corrected behaviour in
+    # kgfm.train; set them False only to reproduce a pre-2026-08-25 run.
+    interleave_files: Optional[bool] = None
+    valid_loss_shuffle: Optional[bool] = None
     n_eval_triples: int = 5_000
     pool_size: int = 5_000
     max_filter_tails: int = 50_000
@@ -159,6 +188,8 @@ class BenchConfig:
     # Flags the user actually typed. Applied *after* the per-cell overrides,
     # because a CLI flag is a single global override by definition.
     cli_overrides: Dict[str, Any] = field(default_factory=dict)
+    # Memoized epoch sizes, keyed by the caps that change them. Not a setting.
+    _epoch_cache: Dict[Any, int] = field(default_factory=dict, repr=False)
 
     # --- control ---
     skip: List[str] = field(default_factory=list)
@@ -195,6 +226,34 @@ class BenchConfig:
         """Just the tags — the identity of each cell in the run directory."""
         return [spec[3] for spec in self.cell_specs()]
 
+    def _epoch_steps(self, epochs: float, batch_size: int,
+                     max_rows_per_file: Optional[int],
+                     accum: int) -> int:
+        """Steps for `epochs` passes over train_list, memoized per cell shape.
+
+        The row count itself is cached on disk by `data.count_rows`, so this is
+        a one-off ~1 minute cost per corpus and instant afterwards.
+        """
+        import math
+
+        from ..data import epoch_examples, read_file_list
+
+        if epochs <= 0:
+            raise SystemExit(f"max_epoch must be positive (got {epochs})")
+        key = (max_rows_per_file,)
+        if key not in self._epoch_cache:
+            files = read_file_list(self.train_list)
+            if not files:
+                raise SystemExit(
+                    f"max_epoch needs a readable train list; {self.train_list} "
+                    "listed no files."
+                )
+            self._epoch_cache[key] = epoch_examples(
+                files, max_rows_per_file=max_rows_per_file
+            )
+        per_step = batch_size * max(1, int(self.nproc)) * max(1, accum)
+        return max(1, math.ceil(epochs * self._epoch_cache[key] / per_step))
+
     def resolve_cell(self, tag: str) -> Dict[str, Any]:
         """Settings for one cell: defaults <- cells[tag] <- CLI overrides.
 
@@ -205,6 +264,18 @@ class BenchConfig:
         resolved.update(self.cells.get(tag, {}))
         resolved.update({k: v for k, v in self.cli_overrides.items()
                          if k in CELL_FIELDS})
+
+        # `max_epoch` wins over `max_steps`, and is turned into steps *here* so
+        # that the cadences below and the `--max-steps` the cell receives all
+        # agree on one number. Dividing by nproc is what makes a 1-epoch config
+        # correct on any GPU count: each rank reads files[rank::world_size].
+        if resolved["max_epoch"] is not None:
+            resolved["max_steps"] = self._epoch_steps(
+                float(resolved["max_epoch"]),
+                int(resolved["batch_size"]),
+                resolved["max_rows_per_file"],
+                int(resolved["gradient_accumulation_steps"]),
+            )
 
         # Derived cadences, computed from *this cell's* max_steps: a cell may
         # train for a different number of steps than its neighbours, and
@@ -270,7 +341,7 @@ class BenchConfig:
 
     def as_meta(self) -> Dict[str, Any]:
         """The parameter block recorded in meta.json."""
-        skip_fields = {"skip", "resume"}
+        skip_fields = {"skip", "resume", "_epoch_cache"}
         return {
             f.name: getattr(self, f.name)
             for f in fields(self)
@@ -282,7 +353,11 @@ class BenchConfig:
 # YAML config files
 # ---------------------------------------------------------------------------
 
-CONFIG_DIR = "benchmarks"
+# Searched in order for a bare `--config <name>`. `benchmark_scaling/` mirrors
+# `benchmarks/` and holds the scaling-study configs; they are the same file
+# format and run through the same pipeline, so they share the lookup.
+CONFIG_DIRS = ("benchmarks", "benchmark_scaling")
+CONFIG_DIR = CONFIG_DIRS[0]          # default home for a new config
 # The prefix keeps settings files distinguishable from any other YAML that
 # ends up in benchmarks/ (upstream clones bring their own configs).
 CONFIG_GLOB = "config_*.yaml"
@@ -314,10 +389,13 @@ def load_config_file(path: str) -> Dict[str, Any]:
         # A bare name is looked up in benchmarks/, with and without the
         # `config_` prefix, so both `--config large` and `--config config_large`
         # find benchmarks/config_large.yaml.
-        for name in (f"{path}.yaml", f"config_{path}.yaml"):
-            candidate = Path(CONFIG_DIR) / name
-            if candidate.is_file():
-                file_path = candidate
+        for directory in CONFIG_DIRS:
+            for name in (f"{path}.yaml", f"config_{path}.yaml"):
+                candidate = Path(directory) / name
+                if candidate.is_file():
+                    file_path = candidate
+                    break
+            if file_path.is_file():
                 break
         else:
             raise SystemExit(
@@ -358,7 +436,7 @@ def _parse_config(loaded: Dict[str, Any], file_path: Path) -> Dict[str, Any]:
     """Flatten a two-level config file into BenchConfig field overrides."""
     all_fields = {f.name for f in fields(BenchConfig)}
     # `cli_overrides` is populated from argparse, never from a file.
-    top_level = all_fields - CELL_FIELDS - {"cli_overrides"}
+    top_level = all_fields - CELL_FIELDS - {"cli_overrides", "_epoch_cache"}
 
     overrides: Dict[str, Any] = {}
     cells: Dict[str, Dict[str, Any]] = {}
@@ -383,6 +461,13 @@ def _parse_config(loaded: Dict[str, Any], file_path: Path) -> Dict[str, Any]:
                 f"at the top level.\nPut it under `defaults:` to apply it to "
                 f"every cell, or under `cells: <tag>:` for one cell."
             )
+        elif key in _RENAMED:
+            raise SystemExit(
+                f"{file_path}: `{key}` was renamed to `{_RENAMED[key]}`.\n"
+                "It only caps `kgfm bench prep` (the entity-ID KG that ULTRA "
+                "and MOTIF read) and never limited kgfm's own training, which "
+                "the old name obscured."
+            )
         else:
             raise SystemExit(
                 f"{file_path}: unknown setting: {key}\n"
@@ -398,11 +483,13 @@ def _parse_config(loaded: Dict[str, Any], file_path: Path) -> Dict[str, Any]:
 
 
 def available_configs() -> List[str]:
-    """YAML settings files shipped under ``benchmarks/``."""
-    directory = Path(CONFIG_DIR)
-    if not directory.is_dir():
-        return []
-    return sorted(p.stem for p in directory.glob(CONFIG_GLOB))
+    """YAML settings files shipped under any of ``CONFIG_DIRS``."""
+    found: List[str] = []
+    for directory in CONFIG_DIRS:
+        d = Path(directory)
+        if d.is_dir():
+            found.extend(sorted(p.stem for p in d.glob(CONFIG_GLOB)))
+    return found
 
 
 def build_config(

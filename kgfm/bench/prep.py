@@ -96,10 +96,10 @@ def build_kg(cfg: BenchConfig) -> dict:
     ent2id: Dict[str, int] = {}
     rel2id: Dict[str, int] = {}
 
-    print(f"[prep] streaming train -> {cfg.kg_dir}/train.txt (max={cfg.max_train:,})")
+    print(f"[prep] streaming train -> {cfg.kg_dir}/train.txt (max={cfg.prep_max_train:,})")
     n_train = _stream_split(
         cfg.train_list, os.path.join(cfg.kg_dir, "train.txt"),
-        max_rows=cfg.max_train, seed=cfg.seed,
+        max_rows=cfg.prep_max_train, seed=cfg.seed,
         ent2id=ent2id, rel2id=rel2id, freeze_vocab=False,
     )
     print(f"[prep] train: kept={n_train:,} |E|={len(ent2id):,} |R|={len(rel2id):,}")
@@ -110,14 +110,14 @@ def build_kg(cfg: BenchConfig) -> dict:
     print(f"[prep] streaming valid ({mode}: freeze_vocab={freeze})")
     n_valid = _stream_split(
         cfg.valid_list, os.path.join(cfg.kg_dir, "valid.txt"),
-        max_rows=cfg.max_valid, seed=cfg.seed + 1,
+        max_rows=cfg.prep_max_valid, seed=cfg.seed + 1,
         ent2id=ent2id, rel2id=rel2id, freeze_vocab=freeze,
     )
 
     print(f"[prep] streaming test ({mode}: freeze_vocab={freeze})")
     n_test = _stream_split(
         cfg.test_list, os.path.join(cfg.kg_dir, "test.txt"),
-        max_rows=cfg.max_test, seed=cfg.seed + 2,
+        max_rows=cfg.prep_max_test, seed=cfg.seed + 2,
         ent2id=ent2id, rel2id=rel2id, freeze_vocab=freeze,
     )
 
@@ -130,9 +130,9 @@ def build_kg(cfg: BenchConfig) -> dict:
         "n_train": n_train,
         "n_valid": n_valid,
         "n_test": n_test,
-        "max_train": cfg.max_train,
-        "max_valid": cfg.max_valid,
-        "max_test": cfg.max_test,
+        "prep_max_train": cfg.prep_max_train,
+        "prep_max_valid": cfg.prep_max_valid,
+        "prep_max_test": cfg.prep_max_test,
         "seed": cfg.seed,
         "mode": mode,
         "train_list": cfg.train_list,

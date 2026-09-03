@@ -48,13 +48,19 @@ _BASELINE_FILES = ("ultra.json", "motif.json")
 # gnorm is absent when --grad-clip is 0, and in logs written before it existed.
 _STEP_RE = re.compile(
     r"^\[step\s+(\d+)\]\s+loss=([-\d.eE+]+)\s+rate=([\d.]+)"
-    r"(?:\s*ex/s\s*gnorm=([-\d.eE+]+))?"
+    r"(?:\s*ex/s)?(?:\s*gnorm=([-\d.eE+]+))?(?:\s*tokens=(\d+))?"
 )
 # "[init] device=cuda:0 world_size=1 ... global_bs=256"
 _GLOBAL_BS_RE = re.compile(r"^\[init\].*global_bs=(\d+)")
+_WORLD_RE = re.compile(r"^\[init\].*world_size=(\d+)")
 # "[valid eval @ step 1000] {'MRR': ..., ...}"
 _EVAL_RE = re.compile(r"^\[(\w+) eval @ step (\d+)\]\s*(\{.*\})\s*$")
-_INIT_RE = re.compile(r"^\[init\] encoder=(\S+) dim=(\d+) params total=([\d,]+)")
+# `head=` was added to this line later, so the middle is matched loosely
+# rather than positionally — a strict pattern silently emptied encoder_info.
+_INIT_RE = re.compile(
+    r"^\[init\] encoder=(\S+).*?dim=(\d+) params total=([\d,]+)"
+    r"(?: trainable=([\d,]+))?"
+)
 
 
 @dataclass
@@ -72,10 +78,16 @@ class TrainingCurve:
     losses: List[float] = field(default_factory=list)
     rates: List[float] = field(default_factory=list)
     grad_norms: List[Tuple[int, float]] = field(default_factory=list)
+    # (step, cumulative padded tokens through the encoder on one rank).
+    tokens: List[Tuple[int, int]] = field(default_factory=list)
     valid_losses: List[Tuple[int, float]] = field(default_factory=list)
     valid_metrics: Dict[str, List[Tuple[int, float]]] = field(default_factory=dict)
     encoder_info: str = ""
+    encoder_name: str = ""
+    params_total: Optional[int] = None
+    params_trainable: Optional[int] = None
     global_batch_size: Optional[int] = None
+    world_size: Optional[int] = None
 
     @property
     def evals(self) -> List[Tuple[int, float]]:
@@ -129,10 +141,17 @@ def parse_training_log(path: Path) -> TrainingCurve:
             curve.rates.append(float(m.group(3)))
             if m.group(4):
                 curve.grad_norms.append((step, float(m.group(4))))
+            if m.group(5):
+                curve.tokens.append((step, int(m.group(5))))
             continue
         m = _GLOBAL_BS_RE.match(line)
         if m and curve.global_batch_size is None:
             curve.global_batch_size = int(m.group(1))
+            # Same `[init]` line carries world_size, so read it here rather
+            # than in its own branch that this `continue` would skip.
+            w = _WORLD_RE.match(line)
+            if w:
+                curve.world_size = int(w.group(1))
             continue
         m = _EVAL_RE.match(line)
         if m:
@@ -158,6 +177,10 @@ def parse_training_log(path: Path) -> TrainingCurve:
             continue
         m = _INIT_RE.match(line)
         if m and not curve.encoder_info:
+            curve.encoder_name = m.group(1)
+            curve.params_total = int(m.group(3).replace(",", ""))
+            if m.group(4):
+                curve.params_trainable = int(m.group(4).replace(",", ""))
             curve.encoder_info = f"{m.group(1)}, dim={m.group(2)}, {m.group(3)} params"
     return curve
 
@@ -259,6 +282,16 @@ def load_records(out_dir: Path) -> List[Dict[str, Any]]:
         if record is None:
             print(f"[report] skipping unreadable {path}")
             continue
+        # Carry the cell tag from the filename (`kgfm_<protocol>_<tag>.json`).
+        # It is the *only* reliable cell identity: the tag gains a `_<head>`
+        # segment only when more than one head is swept, so reconstructing it
+        # from the display label silently fails on single-head sweeps and the
+        # training curves go missing. Baseline files have no tag.
+        name = path.stem
+        if name.startswith("kgfm_"):
+            rest = name[len("kgfm_"):]
+            _, _, tag = rest.partition("_")
+            record["cell_tag"] = tag
         records.append(record)
     return records
 

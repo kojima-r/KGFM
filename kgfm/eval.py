@@ -28,7 +28,7 @@ larger and because the filter index has to be materialized.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -170,13 +170,53 @@ def _ranks_with_ties(
     return n_greater + (n_tied + 1.0) / 2.0
 
 
+# Always reported, so a run never has to be re-scored just to learn its
+# Hit@1. `k_hit` is folded in on top, so a custom k still works.
+HIT_KS = (1, 3, 10)
+
+
+def hit_ks(k_hit: int) -> Tuple[int, ...]:
+    """The Hit@k cutoffs to report: the standard set plus any custom k."""
+    return tuple(sorted({*HIT_KS, int(k_hit)}))
+
+
 def _accumulate_metrics(
     ranks: torch.Tensor, k_hit: int, totals: Dict[str, float]
 ) -> None:
     ranks = ranks.to(torch.float32)
     totals["rr"] += (1.0 / ranks).sum().item()
-    totals["hit"] += (ranks <= k_hit).sum().item()
     totals["ndcg"] += (1.0 / torch.log2(ranks + 1.0)).sum().item()
+    # Mean rank, not mean reciprocal rank: dominated by the worst-ranked
+    # queries, which is exactly why it is worth having next to MRR.
+    totals["mr"] += ranks.sum().item()
+    for k in hit_ks(k_hit):
+        totals[f"hit@{k}"] += (ranks <= k).sum().item()
+
+
+def _empty_metrics(k_hit: int, protocol: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"MRR": 0.0, "MR": 0.0, "nDCG": 0.0, "n": 0,
+                           "protocol": protocol}
+    for k in hit_ks(k_hit):
+        out[f"Hit@{k}"] = 0.0
+    return out
+
+
+def _new_totals(k_hit: int) -> Dict[str, float]:
+    totals = {"rr": 0.0, "ndcg": 0.0, "mr": 0.0}
+    for k in hit_ks(k_hit):
+        totals[f"hit@{k}"] = 0.0
+    return totals
+
+
+def _finalize_metrics(totals: Dict[str, float], n: int, k_hit: int) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "MRR": totals["rr"] / n,
+        "MR": totals["mr"] / n,
+        "nDCG": totals["ndcg"] / n,
+    }
+    for k in hit_ks(k_hit):
+        out[f"Hit@{k}"] = totals[f"hit@{k}"] / n
+    return out
 
 
 @torch.no_grad()
@@ -197,8 +237,7 @@ def _evaluate_pooled(
         test_files, pool_size=pool_size, max_text_len=max_text_len, seed=seed
     )
     if not pool_texts:
-        return {"MRR": 0.0, f"Hit@{k_hit}": 0.0, "nDCG": 0.0, "n": 0,
-                "protocol": "pooled"}
+        return _empty_metrics(k_hit, "pooled")
 
     pool_idx = {t: i for i, t in enumerate(pool_texts)}
     pool_emb = _encode_tail_pool(scorer, pool_texts, device)  # [P, D]
@@ -216,7 +255,7 @@ def _evaluate_pooled(
         collate_fn=collate_triples, persistent_workers=num_workers > 0,
     )
 
-    totals = {"rr": 0.0, "hit": 0.0, "ndcg": 0.0}
+    totals = _new_totals(k_hit)
     n = 0
     for batch in loader:
         h_text, r_text, t_text = batch["h_text"], batch["r_text"], batch["t_text"]
@@ -241,12 +280,9 @@ def _evaluate_pooled(
             break
 
     if n == 0:
-        return {"MRR": 0.0, f"Hit@{k_hit}": 0.0, "nDCG": 0.0, "n": 0,
-                "protocol": "pooled"}
+        return _empty_metrics(k_hit, "pooled")
     return {
-        "MRR": totals["rr"] / n,
-        f"Hit@{k_hit}": totals["hit"] / n,
-        "nDCG": totals["ndcg"] / n,
+        **_finalize_metrics(totals, n, k_hit),
         "n": n,
         "pool": len(pool_texts),
         "protocol": "pooled",
@@ -274,8 +310,7 @@ def _evaluate_filtered(
         max_tails=max_tails, max_rows=max_filter_rows,
     )
     if not tail_vocab:
-        return {"MRR": 0.0, f"Hit@{k_hit}": 0.0, "nDCG": 0.0, "n": 0,
-                "protocol": "filtered"}
+        return _empty_metrics(k_hit, "filtered")
 
     tail_idx: Dict[str, int] = {t: i for i, t in enumerate(tail_vocab)}
     tail_emb = _encode_tail_pool(scorer, tail_vocab, device)  # [V, D]
@@ -293,7 +328,7 @@ def _evaluate_filtered(
         collate_fn=collate_triples, persistent_workers=num_workers > 0,
     )
 
-    totals = {"rr": 0.0, "hit": 0.0, "ndcg": 0.0}
+    totals = _new_totals(k_hit)
     n = 0
     appended_unknown = 0
     for batch in loader:
@@ -337,12 +372,9 @@ def _evaluate_filtered(
             break
 
     if n == 0:
-        return {"MRR": 0.0, f"Hit@{k_hit}": 0.0, "nDCG": 0.0, "n": 0,
-                "protocol": "filtered"}
+        return _empty_metrics(k_hit, "filtered")
     return {
-        "MRR": totals["rr"] / n,
-        f"Hit@{k_hit}": totals["hit"] / n,
-        "nDCG": totals["ndcg"] / n,
+        **_finalize_metrics(totals, n, k_hit),
         "n": n,
         "vocab": len(tail_vocab),
         "filter_pairs": len(hr_to_tails),
@@ -387,8 +419,7 @@ def evaluate(
     """
     scorer.eval()
     if not test_files:
-        return {"MRR": 0.0, f"Hit@{k_hit}": 0.0, "nDCG": 0.0, "n": 0,
-                "protocol": protocol}
+        return _empty_metrics(k_hit, protocol)
 
     if protocol == "pooled":
         return _evaluate_pooled(

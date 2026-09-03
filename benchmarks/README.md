@@ -150,7 +150,7 @@ bash benchmarks/run_chembl.sh
 
 # 細かく制御 (代表例)。追加の flag は kgfm 側 (bench run) に渡ります
 bash benchmarks/run_chembl.sh \
-    --max-train 200000 --max-valid 5000 --max-test 5000 \
+    --prep-max-train 200000 --prep-max-valid 5000 --prep-max-test 5000 \
     --max-steps 5000 \
     --protocols filtered
 
@@ -194,6 +194,7 @@ kgfm bench configs                       # 同梱の設定ファイル一覧と�
 | `config_large.yaml` | 論文掲載レベル | 約 10.8 時間（12 時間枠） |
 | `config_xlarge.yaml` | 論文掲載レベル・最大 | 約 21.4 時間（24 時間枠） |
 | `config_xlarge_compare.yaml` | アーキテクチャ比較（28 セル） | 約 19 時間（学習 15.9h + 評価 3h） |
+| `config_xxlarge.yaml` | **全 674M 行を 1 エポック**（gte-large + mlp） | 約 10.4 日（2 GPU で 5.2 日） |
 
 ```bash
 bash benchmarks/run_chembl.sh          # small
@@ -201,7 +202,123 @@ bash benchmarks/run_chembl_middle.sh   # middle
 bash benchmarks/run_chembl_large.sh    # large
 bash benchmarks/run_chembl_xlarge.sh   # xlarge
 bash benchmarks/run_chembl_xlarge_compare.sh   # エンコーダ/ヘッド比較
+bash benchmarks/run_chembl_xxlarge.sh          # 全行 1 エポック
 ```
+
+#### 全コーパス 1 エポック (`xxlarge`)
+
+他の config は**スライス**を学習します（各 TSV を順に読み切る実装なので、
+25k step × B=512 は 1 worker あたり 3.2M 行しか消費せず、85 ファイル中
+約 4 個しか触りません）。`config_xxlarge.yaml` はその反対側で、
+`list_chembl/train.txt` の**全行を 1 回**読みます。
+
+実測したコーパスサイズ（`wc -l`、推定ではありません。`_iter_tsv_rows` の
+drop は 0 で keep rate = 1.0000）:
+
+| split | ファイル数 | 行数 | サイズ |
+|---|---|---|---|
+| train | 85 | **674,265,105** | 105.35 GiB |
+| valid | 6 | 25,764,240 | 3.99 GiB |
+| test | 4 | 40,000,000 | 6.36 GiB |
+
+ファイルは均一ではありません（最大 1.81 GB / 最小 39 KB）。「85 × 1000 万行」
+という概算は 26% ずれるので、上の実測値を使っています。
+
+**既定は 28 セル比較で 1 位だった `gte-large` + `mlp` + fine-tune** です
+（filtered MRR 0.4641。ngram + linear は 5 位の 0.4331）。実行時間より性能を
+優先した設定なので、1 エポックは **10.4 日**（B=256、実測 751 ex/s）です。
+
+B=256 は選択ではなく制約です — `gte-large` の fine-tune は B=384 でも 512 でも
+OOM します。0.4641 を出したセルと同じ B なので、この実行はデータ量だけが
+違うことになります。
+
+**長さは step 数ではなく `max_epoch: 1.0` で宣言しています**（後述）。
+バッチサイズと GPU 数から step 数が自動で決まるので、B=256 / 1 GPU なら
+2,633,849 step、`--nproc 2` なら 1,316,925 step で、どちらもちょうど 1 エポックです。
+2 GPU はデータを倍にするのではなく**所要時間を半分にします**（train ファイルは
+`files[rank::world_size]` で分割され、各 rank が互いに素な半分を読むため）。
+
+```bash
+bash benchmarks/run_chembl_xxlarge.sh              # 約 10.4 日
+bash benchmarks/run_chembl_xxlarge.sh --nproc 2    # 約 5.2 日
+
+# 当日中に全行を回したい場合（5 位・MRR 0.4331・約 11 h）
+# step 数の再計算は不要 — max_epoch が B=512 を吸収します
+bash benchmarks/run_chembl_xxlarge.sh \
+    --encoders ngram --heads linear --batch-size 512
+```
+
+ngram のベースライン行を同じレポートに入れたい場合は、**2 回目のパス**として
+同じ run ディレクトリに追加してください（+11 h、全体の約 4%）。`heads` は
+グローバルな軸なので `--encoders gte-large,ngram` では ngram に mlp が付き、
+**ngram + mlp は 28 セル中の最下位（0.2539）**になってしまい 0.4331 は得られません。
+
+```bash
+bash benchmarks/run_chembl_xxlarge.sh --resume latest \
+    --encoders ngram --heads linear --batch-size 512
+```
+
+#### `max_epoch` — step 数の代わりにエポック数で指定する
+
+`max_steps` の代わりに **`max_epoch`（小数可）** でも学習量を指定できます。
+cell 設定なので `defaults:` / `cells:` / `--max-epoch` のいずれでも使えます。
+
+```yaml
+defaults:
+  max_epoch: 1.0      # ちょうど 1 周
+  # max_epoch: 0.25   # コーパスの 1/4
+```
+
+```bash
+kgfm train --max-epoch 1 --train-list list_chembl/train.txt ...
+kgfm bench run --config xxlarge --max-epoch 0.5
+```
+
+step 数は次式で導出されます。**`max_epoch` を指定すると `max_steps` は無視されます。**
+
+```
+steps = ceil(max_epoch × epoch_examples / (batch_size × nproc × grad_accum))
+```
+
+`nproc` が分母に入るので、**GPU 数やバッチサイズを変えても 1.0 は 1 エポックの
+まま**です。これまで「2 GPU では max_steps を手で半分にする」必要があったのが
+不要になります。
+
+エポックのサイズはファイルの**実行数**から求めます（ChEMBL のファイルは
+1.81 GB〜39 KB と不均一なので、1 ファイル分から掛け算すると 26% ずれます）。
+105 GiB の読み取りで初回は約 5 分かかりますが、`(パス, サイズ, mtime)` を
+キーに `~/.cache/kgfm/rowcounts.json` へキャッシュされるので 2 回目以降は
+即時です（`KGFM_ROWCOUNT_CACHE` で場所を変更可）。`max_rows_per_file` と
+`row_keep_prob` はエポックサイズに反映されます。
+
+エンコーダごとの 1 エポック所要時間（28 セル比較で実測したスループットから
+単純計算）:
+
+| エンコーダ | mode | ex/s | 1 エポック | 2 GPU |
+|---|---|---|---|---|
+| `ngram` | fine-tune | 17,000 | **11.0 h** | 5.5 h |
+| `bert-multilingual` | frozen | 2,434 | 3.2 日 | 38.5 h |
+| `bert-multilingual` | fine-tune | 1,498 | 5.2 日 | 2.6 日 |
+| `xlm-roberta-large` | fine-tune | 890 | 8.8 日 | 4.4 日 |
+| `bge` / `e5` / `gte-large` | fine-tune | 756 | 10.3 日 | 5.2 日 |
+| `e5-mistral-7b` | frozen | 192 | **40.6 日** | 20.3 日 |
+
+既定の `gte-large` は 10.4 日、`ngram` なら 11 時間です。どちらを選ぶかは
+「性能優先か時間優先か」で、既定は**性能優先**にしてあります。
+
+なお 25k step の large 実行では fine-tune した transformer が過学習しました
+（train loss は下がり続けるのに valid loss が step 12.5k で底を打って上昇）。
+あれは行の反復による暗記ではありません（0.05 エポック未満なので同じ行は
+二度と現れない）— 到達できた数ファイルへの適合、つまり母集団シフトでした。
+全エポックは 85 ファイルすべてに到達するので、**この失敗モードに対する
+回避策ではなく直接的な対処**になります。
+
+> **filtered の値は他の config と比較できません。** 全コーパスの |E| は未計測で
+> （674M 行の prep が必要）、filtered プロトコルが全エンティティを埋め込むのは
+> 不可能なので、`max_filter_tails: 2000000` は |E| ではなく「評価が終わる上限」
+> です。候補が |E| より少ないぶん **楽観的な値**になります。large / xlarge は
+> `max_filter_tails ≈ |E|` なので、xxlarge の filtered はこの config 内でのみ
+> 比較してください。
 
 #### アーキテクチャ比較
 
@@ -233,6 +350,11 @@ bash benchmarks/run_chembl_xlarge_compare.sh --encoders ngram,bge-large --heads 
 bash benchmarks/run_chembl_large_2gpu.sh    # config_large.yaml  + --nproc 2
 bash benchmarks/run_chembl_xlarge_2gpu.sh   # config_xlarge.yaml + --nproc 2
 ```
+
+> **2026-08-16 の修正**: それ以前の `--nproc 2` 実行は **DDP の勾配同期が全く
+> 効いておらず**、2 つの独立したモデルを学習して rank 1 の結果を捨てていました
+> （`in_batch_negative_loss` が `DDP.forward` を迂回していたため）。修正済みで、
+> 以下の記述は修正後の挙動です。1 GPU の結果は影響を受けません。
 
 **負例数は GPU 台数で変わりません。** `in_batch_negative_loss` の `[B,B]`
 行列は各 rank のローカルなマイクロバッチから作られ、kgfm には埋め込みの
@@ -319,8 +441,8 @@ defaults:
 README の「test サンプル数と評価指標への影響」節のガイドラインに従って
 います。
 
-- `max_test >= 10,000` — MRR の標準誤差が約 ±0.004 に収まる水準
-- `n_eval_triples = max_test` — kgfm もベースラインと同じ件数を評価する
+- `prep_max_test >= 10,000` — MRR の標準誤差が約 ±0.004 に収まる水準
+- `n_eval_triples = prep_max_test` — kgfm もベースラインと同じ件数を評価する
   （既定の 5,000 打ち切りを無効化）
 - `max_filter_tails ≈ |E|` — filtered の候補語彙を切り詰めない
 - `freezes: ["off", "on"]` — フル fine-tune と凍結エンコーダの ablation
@@ -359,7 +481,14 @@ bash benchmarks/run_chembl.sh --max-steps 1000   # small.yaml の 200 を上書�
 
 | 階層 | 何を書くか | 例 |
 |---|---|---|
-| トップレベル | **run 全体**の設定。セルごとに変えられない | `max_train`, `encoders`, `freezes`, `nproc` |
+| トップレベル | **run 全体**の設定。セルごとに変えられない | `prep_max_train`, `encoders`, `freezes`, `nproc` |
+
+> **`prep_max_*` は kgfm の学習量ではありません。** これは `kgfm bench prep`
+> が作る entity-ID KG（ULTRA / MOTIF が読むもの）の行数上限です。kgfm 自身は
+> `train_list` の生 TSV を直接ストリームし、この KG を読みません。旧名の
+> `max_train` は run 全体の上限のように見えて紛らわしかったため、接頭辞を
+> 付けました。2 つのベースラインは**同じ** KG を読むので、キャップは
+> 手法ごとではなく 1 組です。学習量を決めるのは `max_steps` / `max_epoch` です。
 | `defaults:` | **全セル共通**のセル設定 | `max_steps`, `batch_size`, `proj_dim` |
 | `cells: <tag>:` | **そのセルだけ**の設定 | `transformer: {batch_size: 64}` |
 
@@ -367,7 +496,7 @@ bash benchmarks/run_chembl.sh --max-steps 1000   # small.yaml の 200 を上書�
 `encoders` × `freezes` が実際に生成するセルでなければエラーになります。
 
 ```yaml
-max_train: 250000                 # run 全体
+prep_max_train: 250000                 # run 全体
 encoders: [ngram, transformer]
 freezes: ["off", "on"]
 
@@ -423,7 +552,7 @@ cell transformer_frozen  max_steps=25000 batch_size=512 eval_every=2500 proj_dim
 | --- | --- | --- |
 | `--config PATH` | なし | YAML 設定ファイル (`benchmarks/*.yaml`) |
 | `--conda-env NAME` | `kgfm` | 子プロセスを動かす conda env |
-| `--max-train N` / `--max-valid N` / `--max-test N` | 50000 / 2000 / 2000 | ChEMBL prep の三つ組キャップ |
+| `--prep-max-train N` / `--prep-max-valid N` / `--prep-max-test N` | 50000 / 2000 / 2000 | ChEMBL prep の三つ組キャップ |
 | `--max-steps N` | 200 | kgfm の学習ステップ数 |
 | `--batch-size N` | 256 | kgfm の学習バッチサイズ (per-device・**全セル**) |
 | `--transformer-batch-size N` | （`--batch-size` と同じ） | transformer エンコーダ系のセルだけバッチサイズを上書き。BERT-base のフル fine-tune は B=1024 で OOM するため、こちらで個別に下げる |
@@ -459,7 +588,7 @@ cell transformer_frozen  max_steps=25000 batch_size=512 eval_every=2500 proj_dim
 | test  |   6.4 GB | ~43.2M |  2,000 ≈ 0.0046% |  10,000 ≈ 0.023% |
 
 両既定値とも全コーパスの **0.1% 未満**で、`large` でも 1 epoch には程遠い
-水準です。1% 超を狙う場合は `--max-train` を数百万オーダー（例: 7,000,000
+水準です。1% 超を狙う場合は `--prep-max-train` を数百万オーダー（例: 7,000,000
 で約 1%）まで上げてください。エンティティ語彙が ULTRA / MOTIF の推論時
 メモリに収まる範囲を意識する必要があります。
 
@@ -468,14 +597,14 @@ cell transformer_frozen  max_steps=25000 batch_size=512 eval_every=2500 proj_dim
 ```bash
 bash benchmarks/run_chembl_large.sh
 bash benchmarks/run_chembl_large.sh --encoders ngram --skip motif
-bash benchmarks/run_chembl_large.sh --max-train 7000000   # ~1% 相当
+bash benchmarks/run_chembl_large.sh --prep-max-train 7000000   # ~1% 相当
 ```
 
 | 設定 | `small.yaml` | `large.yaml` |
 |---|---|---|
-| `--max-train`              | 50,000    | **500,000** |
-| `--max-valid`              | 2,000     | **10,000** |
-| `--max-test`               | 2,000     | **10,000** |
+| `--prep-max-train`              | 50,000    | **500,000** |
+| `--prep-max-valid`              | 2,000     | **10,000** |
+| `--prep-max-test`               | 2,000     | **10,000** |
 | `--max-steps`              | 200       | **2,000** |
 | `--batch-size`             | 256       | **1,024** |
 | `--transformer-batch-size` | (= `--batch-size`) | **64** |
@@ -595,7 +724,7 @@ kgfm bench prep --out-dir latest \
     --valid-list list_chembl/valid.txt \
     --test-list  list_chembl/test.txt \
     --kg-dir benchmarks/chembl_kg \
-    --max-train 2000000 --max-valid 20000 --max-test 20000
+    --prep-max-train 2000000 --prep-max-valid 20000 --prep-max-test 20000
 ```
 
 kgfm の生 TSV をストリーミングし、`head\trel\ttail` 形式の三つ組ファイル
@@ -827,7 +956,7 @@ MRR / Hit@1 / Hit@3 / Hit@10 / nDCG を比較する Markdown テーブルが
 | 手法 | `n_eval` の定義 | 上限 |
 |---|---|---|
 | `kgfm` | **tail 方向のみ**にストリーミング評価したカウント (`kgfm/eval.py` の `n`) | `--n-eval-triples` (既定 **5000**) で打ち切り |
-| `ULTRA` | `script/run.py` の `test()` に渡る `len(test_triplets)` = `test.txt` の全行数 | `--max-test` (`kgfm bench prep`) |
+| `ULTRA` | `script/run.py` の `test()` に渡る `len(test_triplets)` = `test.txt` の全行数 | `--prep-max-test` (`kgfm bench prep`) |
 | `MOTIF` | 同上 | 同上 |
 
 ULTRA / MOTIF は head 方向と tail 方向の両方で順位付けして平均するため、
@@ -840,18 +969,18 @@ MRR / Hit@K の **分母は実質 `2 × n_eval`** です。kgfm は tail 片方�
   広く、MRR ≈ 0.10〜0.20 のレンジで標準誤差は ±0.005〜±0.010 (95%CI
   でおおよそ ±0.01〜±0.02) 程度です。**手法間の差が 1〜2 ポイント以内
   なら有意とは主張できません。** `large` プリセット
-  (`--max-test 10000`) ならおおむね √5 倍狭まります。
+  (`--prep-max-test 10000`) ならおおむね √5 倍狭まります。
 - **kgfm の打ち切り (`--n-eval-triples`)** — 既定は
-  **5,000** です。`large` プリセットのように `--max-test 10000`
+  **5,000** です。`large` プリセットのように `--prep-max-test 10000`
   で test ファイルを大きくしても、kgfm 側は 5,000 で評価を打ち切ります
   (ULTRA / MOTIF は test 全件を評価)。test 全件で kgfm を回したい場合は
-  `--n-eval-triples >= --max-test` を明示してください。なお
-  `small` プリセットの既定 (`--max-test 2000 < 5000`) では test
+  `--n-eval-triples >= --prep-max-test` を明示してください。なお
+  `small` プリセットの既定 (`--prep-max-test 2000 < 5000`) では test
   ファイルが先に尽きるため、この打ち切りは発動しません。
 - **kgfm 評価対象のシャッフル** — `kgfm/eval.py` の
   `StreamingTripleDataset` はファイル順をシャッフルしバッファ内も
   shuffle しますが、ChEMBL の TSV はファイル境界で activity ID
-  (したがって関係タイプ) が偏ります。`--n-eval-triples` を `--max-test`
+  (したがって関係タイプ) が偏ります。`--n-eval-triples` を `--prep-max-test`
   より小さくすると **関係タイプ分布が test 全体と乖離** することが
   あるので注意してください。
 - **filtered プロトコルの `--max-filter-tails` / `--max-filter-rows`** —
@@ -867,16 +996,16 @@ MRR / Hit@K の **分母は実質 `2 × n_eval`** です。kgfm は tail 片方�
   行数|` 程度を取り、(a)(b) いずれも実質発動しない領域で走らせるか、
   もしくは `--protocols pooled` で揃えてください (pooled なら
   `pool_size` が 3 手法とも同じ意味になります)。
-- **`kgfm bench prep --max-test`** — これは 3 手法共通の上限です
+- **`kgfm bench prep --prep-max-test`** — これは 3 手法共通の上限です
   (test.txt のサイズそのもの)。ここを大きくすれば 3 手法とも信頼区間が
   同じだけ狭まります。kgfm の `--n-eval-triples` だけ大きくしても、
-  `--max-test` で先に切られた test ファイルより多くは評価できません。
+  `--prep-max-test` で先に切られた test ファイルより多くは評価できません。
 
 ### 実務上のガイドライン
 
 - 公開できる数値を出すときは少なくとも `large` プリセット
-  水準 (`--max-test 10000`、可能なら `--max-test 50000` 以上) で取り、
-  `--n-eval-triples` を `--max-test` 以上に設定してください。
+  水準 (`--prep-max-test 10000`、可能なら `--prep-max-test 50000` 以上) で取り、
+  `--n-eval-triples` を `--prep-max-test` 以上に設定してください。
 - 手法間で差を主張する場合は、`table.md` の `n_eval` と Protocol が
   揃っていることを確認した上で、差が標本誤差を上回るか併記してください。
 - kgfm を filtered で評価する場合、`--max-filter-tails` ≈ `|E|`、
@@ -888,7 +1017,7 @@ MRR / Hit@K の **分母は実質 `2 × n_eval`** です。kgfm は tail 片方�
 
 ## 動作確認時の実測値
 
-データ: `kgfm bench prep --max-train 50000 --max-valid 2000 --max-test 2000`
+データ: `kgfm bench prep --prep-max-train 50000 --prep-max-valid 2000 --prep-max-test 2000`
 （|E| = 72,669, |R| = 22, inductive モード）、kgfm は 200 steps。
 
 | 手法 | Protocol | MRR | Hit@1 | Hit@3 | Hit@10 | MR | n_eval |
@@ -1109,5 +1238,5 @@ benchmarks/                 # シェルは薄いラッパのみ
   も同一です。`run_motif.py` も `run_ultra.py` とほぼ並行な構造に
   なっています。
 - **GPU メモリ** — ULTRA の NBFNet メッセージパッシングは `|E| · L`
-  (L はレイヤ数) でスケールします。OOM になったら `--max-train` を
+  (L はレイヤ数) でスケールします。OOM になったら `--prep-max-train` を
   下げるか、`run_ultra.py` 内の batch_size を縮めてください。

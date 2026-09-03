@@ -57,9 +57,13 @@ def _add_data(p: argparse.ArgumentParser) -> None:
     p.add_argument("--train-list", default=None)
     p.add_argument("--valid-list", default=None)
     p.add_argument("--test-list", default=None)
-    p.add_argument("--max-train", type=int, default=None)
-    p.add_argument("--max-valid", type=int, default=None)
-    p.add_argument("--max-test", type=int, default=None)
+    # Named `prep_` because they cap `kgfm bench prep` only — the entity-ID KG
+    # that ULTRA / MOTIF consume. kgfm's own training streams --train-list.
+    p.add_argument("--prep-max-train", type=int, default=None,
+                   help="Rows streamed into the prepared KG's train split "
+                        "(ULTRA/MOTIF only; does not limit kgfm training).")
+    p.add_argument("--prep-max-valid", type=int, default=None)
+    p.add_argument("--prep-max-test", type=int, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--strict-transductive", action="store_true", default=None,
                    help="Drop valid/test triples with entities unseen in "
@@ -87,6 +91,11 @@ def _add_sweep(p: argparse.ArgumentParser) -> None:
     # — that is what the two levels are for. `--transformer-batch-size` used
     # to live here and is now `cells: transformer: batch_size:`.
     p.add_argument("--max-steps", type=int, default=None)
+    p.add_argument("--max-epoch", type=float, default=None,
+                   help="Passes over the train data instead of a step count "
+                        "(fractional allowed). Overrides --max-steps and "
+                        "accounts for batch size, --nproc and grad accum, so "
+                        "1.0 is one epoch on any GPU count.")
     p.add_argument("--batch-size", type=int, default=None,
                    help="Batch size for EVERY cell. Per-cell values belong in "
                         "the config file under `cells:`.")
@@ -128,6 +137,20 @@ def _add_sweep(p: argparse.ArgumentParser) -> None:
                    action="store_const", const=False, default=None,
                    help="Keep duplicate tails as in-batch negatives "
                         "(masking them is the default).")
+    p.add_argument("--no-interleave-files", dest="interleave_files",
+                   action="store_const", const=False, default=None,
+                   help="Read each TSV to its end before the next, instead of "
+                        "round-robin. Only for reproducing pre-2026-08-25 runs "
+                        "— it makes the stream a sequence of distributions.")
+    p.add_argument("--no-valid-loss-shuffle", dest="valid_loss_shuffle",
+                   action="store_const", const=False, default=None,
+                   help="Measure the validation loss on the unshuffled stream, "
+                        "whose in-batch negatives are near-duplicate "
+                        "neighbours. Only for reproducing older numbers.")
+    p.add_argument("--ckpt-every", type=int, default=None,
+                   help="Steps between last.pt rewrites (default 1000). Raise "
+                        "it for very long runs — each write is the model plus "
+                        "the optimizer state.")
     p.add_argument("--max-rows-per-file", type=int, default=None,
                    help="Rows to read from each TSV before moving to the next. "
                         "Unset reads to the end — on ChEMBL (10M rows/file) a "

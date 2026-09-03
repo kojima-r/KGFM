@@ -54,8 +54,17 @@ def env_python(env_name: str = DEFAULT_ENV) -> str:
 
 
 def kgfm_cmd(env_name: str = DEFAULT_ENV) -> List[str]:
-    """Command prefix that re-enters this CLI in ``env_name``."""
-    return [env_python(env_name), "-m", "kgfm"]
+    """Command prefix that re-enters this CLI in ``env_name``.
+
+    ``-u`` because every caller runs this as a child whose stdout is a pipe,
+    and Python block-buffers a pipe in 8 KB chunks. Without it a cell that
+    trains for an hour writes nothing to its `cell_*.log` until the buffer
+    happens to fill — so progress is invisible while it runs, and anything
+    still in the buffer is lost if the run is killed. Those logs are not just
+    for reading: `kgfm report` and `kgfm scaling` parse the training curves
+    back out of them, so a lost tail is lost data.
+    """
+    return [env_python(env_name), "-u", "-m", "kgfm"]
 
 
 def torchrun_cmd(env_name: str = DEFAULT_ENV) -> List[str]:

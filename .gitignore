@@ -51,3 +51,6 @@ benchmarks/ULTRA/
 benchmarks/MOTIF/
 benchmarks/chembl_kg/
 benchmarks/results/
+# Scaling-study run directories and LR-probe output; same reason as above —
+# multi-GB of logs, checkpoints and 5MB HTML reports per run.
+benchmark_scaling/results/

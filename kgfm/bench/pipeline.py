@@ -97,8 +97,9 @@ def run(cfg: BenchConfig) -> Path:
     logger.log(f"    config     = {cfg.config_file or '(defaults)'}")
     logger.log(f"    conda_env  = {cfg.conda_env} ({envs.env_python(cfg.conda_env)})")
     logger.log(f"    gpu        = {_gpu_line()}")
-    logger.log(f"    caps       = train={cfg.max_train} valid={cfg.max_valid} "
-               f"test={cfg.max_test}")
+    logger.log(f"    prep caps  = train={cfg.prep_max_train} "
+               f"valid={cfg.prep_max_valid} test={cfg.prep_max_test} "
+               f"(ULTRA/MOTIF KG only; kgfm streams the TSV lists)")
     logger.log(f"    sweep      = encoders={cfg.encoders} freezes={cfg.freezes} "
                f"protocols={cfg.protocols} nproc={cfg.nproc}")
     # One line per cell rather than one line of global settings: with `cells:`

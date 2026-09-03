@@ -94,7 +94,23 @@ class DistMultScorer(nn.Module):
         return (h * r * t).sum(dim=-1)
 
     def forward(
-        self, h_text: Sequence[str], r_text: Sequence[str], t_text: Sequence[str]
-    ) -> torch.Tensor:
+        self,
+        h_text: Sequence[str],
+        r_text: Sequence[str],
+        t_text: Sequence[str],
+        return_embeddings: bool = False,
+    ):
+        """Score the triples, or return the (h, r, t) embeddings behind them.
+
+        `return_embeddings` exists for the training loss, which needs all three
+        embeddings to build its [B, B] in-batch score matrix. It must be reached
+        **through this forward** rather than by calling `encode_triple` on the
+        module directly: under DDP, `DistributedDataParallel.forward` is what
+        calls `reducer.prepare_for_backward()`, and without that call no
+        gradient all-reduce happens at all and each rank silently trains its own
+        model. See `train.in_batch_negative_loss`.
+        """
         h, r, t = self.encode_triple(h_text, r_text, t_text)
+        if return_embeddings:
+            return h, r, t
         return self.score(h, r, t)

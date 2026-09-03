@@ -62,6 +62,8 @@ def _build_config(args: argparse.Namespace) -> TrainConfig:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_workers=args.num_workers,
         max_rows_per_file=args.max_rows_per_file,
+        interleave_files=args.interleave_files,
+        valid_loss_shuffle=args.valid_loss_shuffle,
         max_steps=args.max_steps,
         log_every=args.log_every,
         eval_every=args.eval_every,
@@ -195,6 +197,10 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--loss", default=DEFAULT_LOSS, choices=list(LOSSES))
     p.add_argument("--loss-temperature", type=float, default=DEFAULT_TEMPERATURE)
     p.add_argument("--max-rows-per-file", type=int, default=None)
+    p.add_argument("--no-interleave-files", dest="interleave_files",
+                   action="store_false", default=True)
+    p.add_argument("--no-valid-loss-shuffle", dest="valid_loss_shuffle",
+                   action="store_false", default=True)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--encoder-weight-decay", type=float, default=None)
     p.add_argument("--head-weight-decay", type=float, default=None)

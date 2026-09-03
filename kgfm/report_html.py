@@ -68,6 +68,11 @@ tbody tr:hover { background: var(--card); }
 .charts { display: flex; flex-wrap: wrap; gap: 1.5rem; }
 .charts figure { margin: 0; flex: 1 1 320px; min-width: 0; }
 .charts.wide figure { flex: 1 1 100%; }
+/* Scatter plots hold their aspect ratio (a 2-D projection is isotropic, so
+   stretching one axis is a lie). A full-width card then letterboxes them:
+   the axes widen to the box and the cloud sits in a narrow central strip.
+   Cap the width so the plot area comes out roughly square instead. */
+.scatterbox { max-width: 760px; }
 .mpl svg { display: block; width: 100%; height: auto; max-width: 760px; }
 .js-plotly-plot { width: 100% !important; }
 figcaption { color: var(--muted); font-size: .8rem; margin-bottom: .25rem; }
@@ -118,8 +123,13 @@ def line_chart(
     width: int = 700,
     height: int = 240,
     y_fmt: Callable[[float], str] = _fmt_num,
+    colors: Optional[Sequence[str]] = None,
 ) -> str:
-    """Render one or more (label, points) series as a standalone inline SVG."""
+    """Render one or more (label, points) series as a standalone inline SVG.
+
+    ``colors`` supplies one explicit colour per series, so a caller can make
+    hue encode a quantity (model size) instead of series order.
+    """
     series = [(name, list(pts)) for name, pts in series if pts]
     if not series:
         return '<p class="note">no data</p>'
@@ -191,7 +201,8 @@ def line_chart(
     )
 
     for i, (name, pts) in enumerate(series):
-        color = _SERIES_COLORS[i % len(_SERIES_COLORS)]
+        color = (colors[i] if colors and i < len(colors) and colors[i]
+                 else _SERIES_COLORS[i % len(_SERIES_COLORS)])
         coords = " ".join(f"{px(x):.1f},{py(y):.1f}" for x, y in pts)
         out.append(
             f'<polyline fill="none" stroke="{color}" stroke-width="2" '
@@ -290,8 +301,8 @@ def scatter_chart_svg(
     *,
     x_label: str,
     y_label: str,
-    width: int = 700,
-    height: int = 420,
+    width: int = 560,
+    height: int = 470,
 ) -> str:
     """Dependency-free point cloud, matching `line_chart`'s look."""
     groups = [(n, list(p)) for n, p in groups if p]
@@ -308,6 +319,16 @@ def scatter_chart_svg(
         x_lo, x_hi = x_lo - 1, x_hi + 1
     if y_hi == y_lo:
         y_lo, y_hi = y_lo - 1, y_hi + 1
+    # Equal scale on both axes: this is a 2-D projection, so stretching one
+    # axis to fill the box would misrepresent the distances the reducer
+    # produced. Widen the range that is short relative to the box instead.
+    x_span, y_span = x_hi - x_lo, y_hi - y_lo
+    if x_span / pw < y_span / ph:
+        extra = (y_span / ph * pw - x_span) / 2
+        x_lo, x_hi = x_lo - extra, x_hi + extra
+    else:
+        extra = (x_span / pw * ph - y_span) / 2
+        y_lo, y_hi = y_lo - extra, y_hi + extra
 
     def px(x: float) -> float:
         return left + (x - x_lo) / (x_hi - x_lo) * pw
@@ -323,8 +344,13 @@ def scatter_chart_svg(
         f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + ph}"/>'
         f'<line x1="{left}" y1="{top + ph}" x2="{left + pw}" y2="{top + ph}"/></g>',
     ]
+    # Same palette as the library backends, so the fallback does not recolour
+    # the categories and does not reuse a hue once there are more than six.
+    from .charts import _scatter_colors
+
+    colors = _scatter_colors(groups)
     for i, (name, pts) in enumerate(groups):
-        color = _SERIES_COLORS[i % len(_SERIES_COLORS)]
+        color = colors[i]
         # One <g> per group keeps the file far smaller than per-point fills.
         out.append(f'<g fill="{color}" fill-opacity=".55">')
         out += [f'<circle cx="{px(x):.1f}" cy="{py(y):.1f}" r="2"/>' for x, y in pts]
@@ -403,13 +429,27 @@ def _cell_charts(curve: Any, backend: str) -> str:
         loss_series, x_label="optimizer step", y_label="loss", backend=backend,
     ), note))
 
+    # MR is a rank (tens to thousands), the rest are scores in [0, 1]. On one
+    # axis the ranks flatten everything else into the baseline, so MR gets its
+    # own chart.
     metric_series = [
-        (name, pts) for name, pts in sorted(curve.valid_metrics.items()) if pts
+        (name, pts) for name, pts in sorted(curve.valid_metrics.items())
+        if pts and name != "MR"
     ]
     if metric_series:
         figures.append(("validation metrics (in-loop eval is always pooled)",
                         charts_mod.chart(metric_series, x_label="optimizer step",
                                          y_label="score", backend=backend), ""))
+    mr_series = curve.valid_metrics.get("MR") or []
+    if mr_series:
+        figures.append((
+            "validation mean rank (lower is better)",
+            charts_mod.chart([("MR", mr_series)], x_label="optimizer step",
+                             y_label="mean rank", backend=backend),
+            '<p class="note">Dominated by the worst-ranked queries, so it moves '
+            "when MRR does not — the two together separate \"a few disasters\" "
+            "from \"uniformly mediocre\".</p>",
+        ))
 
     if curve.valid_losses and curve.gap():
         figures.append((
@@ -558,13 +598,16 @@ def _embedding_section(record: Dict[str, Any], backend: str) -> str:
         groups: Dict[str, List[Tuple[float, float]]] = {}
         for x, y, lab in zip(xs, ys, labels):
             groups.setdefault(_short_label(str(lab)), []).append((x, y))
+        # Unsorted: `scatter_chart` orders the groups itself, largest first,
+        # so the minority class is painted on top rather than under.
         figures.append((
             caption,
-            charts_mod.scatter_chart(
-                sorted(groups.items()), x_label="component 1",
+            '<div class="scatterbox">' + charts_mod.scatter_chart(
+                list(groups.items()), x_label="component 1",
                 y_label="component 2", backend=backend,
-            ),
-            "",
+            ) + "</div>",
+            f'<p class="note">{len(distinct)} distinct values.</p>'
+            if len(distinct) > 10 else "",
         ))
     if not figures:
         return ""
@@ -586,6 +629,11 @@ def _embedding_section(record: Dict[str, Any], backend: str) -> str:
         f"encoded with this checkpoint and projected with {html.escape(reducer)}. "
         "The colour labels are never seen during training — kgfm only reads the "
         "text fields — so any grouping here was learned.</p>"
+        '<p class="note">Classes are painted largest first, so a minority class '
+        "stays on top of the bulk rather than under it. Two classes of equal "
+        "size that occupy the same clusters (head vs tail here) cannot be "
+        "separated by draw order at all — that they cover each other <em>is</em> "
+        "the result. Click a legend entry to isolate one class.</p>"
     )
     figs = "".join(
         f"<figure><figcaption>{html.escape(cap)}</figcaption>{body}{extra}</figure>"
@@ -631,10 +679,16 @@ def _method_sections(
     """
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     names: Dict[str, str] = {}
+    # The cell tag is the identity; `_method_key` only supplies the label and
+    # the sort order. They are NOT interchangeable: a tag gains a `_<head>`
+    # segment only when more than one head is swept, so deriving the tag from
+    # the label loses the curves of every single-head sweep.
+    tags: Dict[str, str] = {}
     for rec in records:
         key, name = _method_key(rec)
         grouped.setdefault(key, []).append(rec)
         names[key] = name
+        tags.setdefault(key, rec.get("cell_tag") or key.split("_", 1)[1])
 
     # Curves are keyed by cell tag; `cell` is "<protocol>_<tag>".
     curve_by_tag: Dict[str, Any] = {}
@@ -647,7 +701,7 @@ def _method_sections(
     out = []
     for key in sorted(grouped):
         recs = grouped[key]
-        tag = key.split("_", 1)[1]        # strip the sort prefix
+        tag = tags[key]
         curve = curve_by_tag.get(tag)
         out.append(f"<h2>{html.escape(names[key])}</h2>")
         cmds = _method_commands(commands or [], tag, [names[key], tag])

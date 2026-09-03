@@ -14,8 +14,9 @@ Two implementations are provided:
 
 from __future__ import annotations
 
+import contextlib
 import zlib
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -90,6 +91,11 @@ class HashedNgramEncoder(nn.Module):
         self.n_max = n_max
         self.max_ngrams = max_ngrams
         self.dropout = float(dropout)
+        # Cumulative units fed to the encoder, for the FLOPs accounting in
+        # kgfm/scaling. For the ngram encoder a "token" is one n-gram lookup;
+        # it is a gather, not a matmul, so it is NOT comparable to a
+        # transformer token — see scaling/compute.py.
+        self.tokens_seen: int = 0
         self.bag = nn.EmbeddingBag(
             vocab_size, embedding_dim, mode="mean", sparse=sparse
         )
@@ -103,6 +109,7 @@ class HashedNgramEncoder(nn.Module):
             texts, self.vocab_size, self.n_min, self.n_max, self.max_ngrams
         )
         device = self.bag.weight.device
+        self.tokens_seen += int(flat.numel())
         return self.drop(self.bag(flat.to(device), offsets.to(device)))
 
 
@@ -130,6 +137,8 @@ class TransformerEncoder(nn.Module):
         dropout: Optional[float] = None,
         trust_remote_code: bool = False,
         load_dtype: Optional[str] = None,
+        random_init: bool = False,
+        config_overrides: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         try:
@@ -146,6 +155,12 @@ class TransformerEncoder(nn.Module):
         self.dropout = dropout
         self.trust_remote_code = trust_remote_code
         self.load_dtype = load_dtype
+        self.random_init = random_init
+        self.config_overrides = dict(config_overrides or {})
+        # Cumulative *padded* tokens through the LM. Measured rather than
+        # estimated because padding is what the GPU actually pays for, and
+        # `padding=True` makes it batch-dependent.
+        self.tokens_seen: int = 0
         kw = {"trust_remote_code": True} if trust_remote_code else {}
         model_kw = dict(kw)
         if load_dtype is not None:
@@ -172,7 +187,34 @@ class TransformerEncoder(nn.Module):
         # the layers read it when they are built. None keeps the pretrained
         # model's own value (0.1 for BERT), which is why this is Optional
         # rather than defaulting to 0.
-        if dropout is None:
+        if random_init:
+            from transformers import AutoConfig
+
+            # Architecture from the config, weights from scratch. The
+            # *tokenizer* still comes from the repo: the vocabulary is a fixed
+            # design choice, not learned capacity, and re-deriving one per
+            # size would vary two things at once.
+            hf_cfg = AutoConfig.from_pretrained(model_name, **kw)
+            # Architecture overrides let the size axis carry points that no
+            # published checkpoint happens to sit on. Only meaningful with
+            # random_init: there are no weights to be inconsistent with, so
+            # changing depth or width is free. Unknown keys are rejected
+            # rather than silently ignored, because a typo here would quietly
+            # train the wrong size and label it as the intended one.
+            for key, value in (config_overrides or {}).items():
+                if not hasattr(hf_cfg, key):
+                    raise ValueError(
+                        f"config_overrides: {model_name} has no config field "
+                        f"{key!r}"
+                    )
+                setattr(hf_cfg, key, value)
+            if dropout is not None:
+                for attr in ("hidden_dropout_prob", "attention_probs_dropout_prob",
+                             "dropout", "attention_dropout"):
+                    if hasattr(hf_cfg, attr):
+                        setattr(hf_cfg, attr, dropout)
+            self.model = AutoModel.from_config(hf_cfg)
+        elif dropout is None:
             self.model = AutoModel.from_pretrained(model_name, **model_kw)
         else:
             from transformers import AutoConfig
@@ -191,6 +233,20 @@ class TransformerEncoder(nn.Module):
                 model_name, config=hf_cfg, **model_kw
             )
         self.embedding_dim: int = int(self.model.config.hidden_size)
+
+        # BERT-family checkpoints carry a `pooler` (a Linear over the [CLS]
+        # state) that this encoder never calls — pooling here is done over
+        # `last_hidden_state`. Its parameters therefore never receive a
+        # gradient, and under DDP that is fatal rather than merely wasteful:
+        # `find_unused_parameters=False` (the default) raises "Expected to have
+        # finished reduction in the prior iteration" on the second step.
+        # Freezing is the precise fix — a parameter that cannot receive a
+        # gradient cannot learn — and unlike `add_pooling_layer=False` it keeps
+        # the weights in the state dict, so checkpoints stay loadable.
+        pooler = getattr(self.model, "pooler", None)
+        if pooler is not None:
+            for p in pooler.parameters():
+                p.requires_grad_(False)
 
         if freeze:
             for p in self.model.parameters():
@@ -220,9 +276,22 @@ class TransformerEncoder(nn.Module):
             return_tensors="pt",
         )
         device = self._device()
+        self.tokens_seen += int(tok["input_ids"].numel())
         tok = {k: v.to(device) for k, v in tok.items()}
 
-        ctx = torch.no_grad() if self.freeze else torch.enable_grad()
+        # A frozen encoder never needs a graph, so force it off. An unfrozen
+        # one must *inherit* the ambient mode, not turn grad on: under
+        # `torch.enable_grad()` this forward re-enabled recording inside every
+        # `@torch.no_grad()` evaluation and built a full training-sized graph
+        # for 3B sequences, which is the memory the eval path was actually
+        # paying. Measured at B=256 on the eval-side encode_triple, peak
+        # allocated: scratch-base 5.299 -> 0.293 GiB, scratch-xl 9.170 ->
+        # 0.387, scratch-large 13.684 -> 0.387; scores bit-identical
+        # (`torch.equal`-level, diff 0.0). Training is unaffected — it never
+        # runs under an ambient no_grad, so nullcontext is the same thing
+        # there. This is why `scratch-large` OOMed in its first in-loop
+        # evaluation while training at the same batch size fit.
+        ctx = torch.no_grad() if self.freeze else contextlib.nullcontext()
         with ctx:
             out = self.model(**tok)
             h = out.last_hidden_state  # [B, L, D]
@@ -273,6 +342,58 @@ class TransformerEncoder(nn.Module):
 #                                DynamicCache no longer has.
 # Both are upstream/version incompatibilities, not configuration mistakes.
 ENCODER_PRESETS: dict = {
+    # --- randomly initialised, for a genuine capacity axis. `random_init`
+    # builds the architecture from its config and skips the pretrained
+    # weights, so N means "how much capacity this model has" instead of "what
+    # its pretraining gave it". That distinction is why the pretrained sweep
+    # produced a power law with an exponent of only -0.018: across the
+    # pretrained BERT family the loss level is set by transfer, not capacity,
+    # and scaling laws describe from-scratch training. The configs are
+    # borrowed from the same family so N lines up with the pretrained cells
+    # and the two can be compared point for point. ---
+    "scratch-tiny":      {"model": "prajjwal1/bert-tiny", "dim": 128,
+                          "random_init": True},
+    "scratch-mini":      {"model": "prajjwal1/bert-mini", "dim": 256,
+                          "random_init": True},
+    "scratch-small":     {"model": "prajjwal1/bert-small", "dim": 512,
+                          "random_init": True},
+    "scratch-medium":    {"model": "prajjwal1/bert-medium", "dim": 512,
+                          "random_init": True},
+    "scratch-base":      {"model": "bert-base-uncased", "dim": 768,
+                          "random_init": True},
+    # --- above BERT-base. An intermediate shape, added when bert-large's own
+    # 24x1024 appeared not to fit; it does fit (see `scratch-large` below),
+    # so this is now a genuine interior point of the size axis rather than a
+    # substitute for one. `encode_triple` pushes 3B sequences per step, so
+    # activation memory is ~3x what a plain LM of the same shape would need,
+    # and B is the in-batch negative count so it cannot be reduced without
+    # changing the task. Depth and width are raised together, because the
+    # 2026-08-26 run showed the 4-layer cells were nearly degenerate in loss
+    # while doubling depth moved it.
+    "scratch-xl":        {"model": "bert-large-uncased", "dim": 1024,
+                          "random_init": True,
+                          "config_overrides": {"num_hidden_layers": 16}},
+    # 24x1024 / 335M, and the real top of the axis on one H200. It used to
+    # OOM in the first in-loop *evaluation* while training fine at the same
+    # B=256, which read as an eval-memory limit; it was not. The eval forward
+    # was building a training-sized autograd graph because
+    # `TransformerEncoder.forward` forced `torch.enable_grad()` over the
+    # ambient `no_grad`. With that fixed the whole cell — training, both
+    # in-loop evals and the final test — runs end to end, verified.
+    # Measured at B=256: train_peak 101.81 GiB, eval_peak 7.98 GiB of 139.8.
+    # So it is TRAINING that binds now, and the next size up would need a
+    # smaller B, which is not available (B is the in-batch negative count).
+    "scratch-large":     {"model": "bert-large-uncased", "dim": 1024,
+                          "random_init": True},
+    # --- tiny, for the left end of a scaling study. Pretrained BERTs from the
+    # same family (Turc et al. 2019), so size varies while the recipe does
+    # not — which is what makes them a size *axis* rather than five unrelated
+    # models. 4.4M to 41M fills the two decades below bert-base, where the
+    # loss has not yet saturated and a scaling slope is still measurable. ---
+    "bert-tiny":         {"model": "prajjwal1/bert-tiny", "dim": 128},
+    "bert-mini":         {"model": "prajjwal1/bert-mini", "dim": 256},
+    "bert-small":        {"model": "prajjwal1/bert-small", "dim": 512},
+    "bert-medium":       {"model": "prajjwal1/bert-medium", "dim": 512},
     # --- baselines / small ---
     "bert-multilingual": {"model": "bert-base-multilingual-cased", "dim": 768},
     "mpnet":             {"model": "sentence-transformers/all-mpnet-base-v2", "dim": 768},
@@ -299,6 +420,16 @@ def preset_info(name: str) -> dict:
 def is_frozen_only(name: str) -> bool:
     """Encoders too large to fine-tune — the sweep skips their freeze=off cell."""
     return bool(preset_info(name).get("frozen_only", False))
+
+
+def config_overrides(name: str) -> Dict[str, Any]:
+    """Architecture overrides a preset applies to its HF config."""
+    return dict(preset_info(name).get("config_overrides", {}) or {})
+
+
+def is_random_init(name: str) -> bool:
+    """Whether this preset builds from config instead of pretrained weights."""
+    return bool(preset_info(name).get("random_init", False))
 
 
 def resolve_encoder(name: str) -> Tuple[str, Optional[str], bool, Optional[str]]:
@@ -357,6 +488,7 @@ def make_encoder(
     encoder_dropout: Optional[float] = None,
 ) -> nn.Module:
     kind, preset_model, trust_remote, load_dtype = resolve_encoder(name)
+    random_init = is_random_init(name)
     if kind == "ngram":
         return HashedNgramEncoder(
             vocab_size=vocab_size,
@@ -377,4 +509,6 @@ def make_encoder(
         dropout=encoder_dropout,
         trust_remote_code=trust_remote,
         load_dtype=load_dtype,
+        random_init=random_init,
+        config_overrides=config_overrides(name),
     )

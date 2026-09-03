@@ -153,10 +153,17 @@ class RunLogger:
         The subprocess path (`run`) tees by reading the child's pipe; steps
         that stay in this interpreter need their prints redirected instead,
         or run.log would only ever record the steps that forked.
+
+        Opened for **append**, not truncation: re-running a step into an
+        existing run directory (`--resume`, or re-scoring a finished
+        checkpoint) would otherwise erase the training history the report and
+        the scaling study read back out of it. `kgfm report` already expects
+        appended logs — it notes that resumed runs can repeat or skip step
+        numbers — so truncating here silently contradicted the reader.
         """
         self.log(f"==> {name}")
         old_out, old_err = sys.stdout, sys.stderr
-        with open(self.out_dir / f"{name}.log", "w", encoding="utf-8") as sf, \
+        with open(self.out_dir / f"{name}.log", "a", encoding="utf-8") as sf, \
                 open(self.log_path, "a", encoding="utf-8") as rf:
             tee = _Tee([old_out, sf, rf])
             sys.stdout = sys.stderr = tee            # type: ignore[assignment]
@@ -198,7 +205,7 @@ class RunLogger:
             self.log(f"    !! {step} could not start: {exc}")
             return StepResult(127)
 
-        with open(step_log, "w", encoding="utf-8") as sf, \
+        with open(step_log, "a", encoding="utf-8") as sf, \
                 open(self.log_path, "a", encoding="utf-8") as rf:
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -206,6 +213,16 @@ class RunLogger:
                 sys.stdout.flush()
                 sf.write(line)
                 rf.write(line)
+                # Flush both, every line. Without this the step log sits in
+                # Python's 8 KB buffer, so a cell that trains for an hour shows
+                # an EMPTY cell_*.log the whole time and there is no way to see
+                # whether it is healthy or already collapsed. The files do flush
+                # on close, so this is not about the happy path — it is that
+                # `kgfm report` and `kgfm scaling` parse the training curves
+                # back out of these logs, and a buffer lost to a kill is lost
+                # data, not just lost output.
+                sf.flush()
+                rf.flush()
                 if capture:
                     chunks.append(line)
         rc = proc.wait()

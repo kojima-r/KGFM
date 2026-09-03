@@ -13,9 +13,9 @@ run_label: chembl_small
 
 # Triple caps for the entity-ID KG the baselines consume. Both are well under
 # 0.1% of the corpus — see "全コーパスに対する --max-* のカバー率" in README.
-max_train: 50000
-max_valid: 2000
-max_test: 2000
+prep_max_train: 50000
+prep_max_valid: 2000
+prep_max_test: 2000
 
 encoders: [ngram, transformer]
 freezes: ["off"]          # quote: bare `off` is boolean False in YAML

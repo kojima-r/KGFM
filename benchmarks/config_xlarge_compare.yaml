@@ -62,9 +62,9 @@ run_label: chembl_xlarge_compare
 
 # Same KG as config_xlarge.yaml, so the numbers sit on the same axis.
 # |E| = 419,252 at this cap (measured by a prep run, not estimated)
-max_train: 400000
-max_valid: 12000
-max_test: 12000
+prep_max_train: 400000
+prep_max_valid: 12000
+prep_max_test: 12000
 
 # Every verified preset. Two more were tried and rejected as always-crashing in
 # this environment (deberta-v3-large, gte-qwen2-7b) — see ENCODER_PRESETS for

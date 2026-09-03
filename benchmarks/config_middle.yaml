@@ -21,9 +21,9 @@ run_label: chembl_middle
 # --- run-level ---
 
 # |E| ~ 182,000 at this cap (measured growth: 50k->72.7k, 200k->231k, 1M->685k)
-max_train: 150000
-max_valid: 6000
-max_test: 6000
+prep_max_train: 150000
+prep_max_valid: 6000
+prep_max_test: 6000
 
 encoders: [ngram, transformer]
 freezes: ["off"]

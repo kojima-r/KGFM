@@ -6,6 +6,7 @@
     kgfm viz ...        project a checkpoint's h / t embeddings to 2D
     kgfm report ...     collect a run directory's results into one table
     kgfm hf    ...      publish a trained scorer to the HuggingFace Hub
+    kgfm scaling ...    scaling-law plots (compute vs loss) for a run
 
 The baselines it is compared against are separate methods with separate
 commands — `kgfm-ultra` and `kgfm-motif` (see `kgfm.baselines`). They share
@@ -35,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Import the functions, not the modules: `kgfm/__init__.py` re-exports a
     # `train` function that shadows the `kgfm.train` submodule attribute.
     from . import hf as hf_mod
+    from .scaling import report as scaling_mod
     from . import report as report_mod
     from . import viz as viz_mod
     from .bench import cli as bench_cli
@@ -69,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
         "hf", help="publish a trained scorer to the HuggingFace Hub")
     hf_mod.add_arguments(hf_p)
     hf_p.set_defaults(func=hf_mod.run_from_args)
+
+    scaling_p = sub.add_parser(
+        "scaling", help="scaling-law plots (compute vs loss) for a run")
+    scaling_mod.add_arguments(scaling_p)
+    scaling_p.set_defaults(func=scaling_mod.run_from_args)
 
     return p
 

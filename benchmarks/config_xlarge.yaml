@@ -23,9 +23,9 @@ run_label: chembl_xlarge
 # --- run-level ---
 
 # |E| = 419,252 at this cap (measured by a prep run, not estimated)
-max_train: 400000
-max_valid: 12000
-max_test: 12000
+prep_max_train: 400000
+prep_max_valid: 12000
+prep_max_test: 12000
 
 encoders: [ngram, transformer]
 freezes: ["off", "on"]

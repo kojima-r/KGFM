@@ -95,6 +95,7 @@ def run_step(cfg: BenchConfig, out_dir: Path, logger: RunLogger) -> List[Path]:
                 ("--head-dropout", "head_dropout"),
                 ("--proj-dim", "proj_dim"),
                 ("--max-rows-per-file", "max_rows_per_file"),
+                ("--ckpt-every", "ckpt_every"),
                 ("--per-device-train-batch-size",
                  "per_device_train_batch_size"),
                 ("--per-device-eval-batch-size",
@@ -104,6 +105,10 @@ def run_step(cfg: BenchConfig, out_dir: Path, logger: RunLogger) -> List[Path]:
                     cell_args += [flag, cell[key]]
             if cell["mask_duplicate_tails"] is False:
                 cell_args.append("--no-mask-duplicate-tails")
+            if cell["interleave_files"] is False:
+                cell_args.append("--no-interleave-files")
+            if cell["valid_loss_shuffle"] is False:
+                cell_args.append("--no-valid-loss-shuffle")
 
             if trained_yet:
                 cell_args.append("--skip-train")

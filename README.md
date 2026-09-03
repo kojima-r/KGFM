@@ -206,6 +206,11 @@ print((h * r * t).sum(-1))   # 行ごとのスコア
 
 | プリセット | モデル | 次元 | 備考 |
 |---|---|---|---|
+| `bert-tiny` | `prajjwal1/bert-tiny` | 128 | 4.4M。以下 4 つは Turc et al. 2019 の同一系統 |
+| `bert-mini` | `prajjwal1/bert-mini` | 256 | 11.2M |
+| `bert-small` | `prajjwal1/bert-small` | 512 | 28.8M |
+| `bert-medium` | `prajjwal1/bert-medium` | 512 | 41.4M |
+| `scratch-tiny` … `scratch-base` | 上記 + `bert-base-uncased` | 128–768 | **ランダム初期化**（4.4M–109.5M） |
 | `bert-multilingual` | `bert-base-multilingual-cased` | 768 | 従来の既定 |
 | `mpnet` | `sentence-transformers/all-mpnet-base-v2` | 768 | |
 | `bge-large` | `BAAI/bge-large-en-v1.5` | 1024 | 検索特化 335M |
@@ -223,6 +228,18 @@ print((h * r * t).sum(-1))   # 行ごとのスコア
 - bf16 でロードしたエンコーダは出力を fp32 に戻します。ヘッドとスコアラは
   fp32 で、**評価は autocast の外で走る**ため、これをやらないと最初の評価で
   `mat1 and mat2 must have the same dtype` になります。
+- **`scratch-*` は重みをダウンロードしません**。`random_init: True` は
+  `AutoModel.from_config()` を通り、config と tokenizer だけを取ります。
+  事前学習をサイズ軸から外すためのもので、`benchmark_scaling/` の
+  スケーリング則測定で使います — `bert-tiny … bert-base` は大きいモデルほど
+  長く事前学習されているため、そのままではサイズと事前学習量が交絡します。
+  既定学習率も別系統で、`train.SCRATCH_LR = 1e-4` です。既存のどちらの値も
+  当てはまらないためです — 3e-5 は「事前学習済みの重みを壊さない」ための値で
+  ここでの制約ではなく、1e-3 は BERT を確実に崩壊させます。**ただし 1e-4 が
+  適切なのは最小サイズだけで、実際の実験ではサイズごとに設定する必要があります**
+  — `scratch-base` は 1e-4 で崩壊し、`scratch-small` は自身の最適値から
+  0.31 nats 離れます。実測値と経緯は `benchmark_scaling/README.md` と
+  `config_scaling_scratch.yaml` を参照してください。
 - `trust_remote_code` が必要なモデルはプリセット側で明示します（自動では
   有効化しません）。
 - **2 つは試して落としました**（常にクラッシュするプリセットを置くより
@@ -489,6 +506,71 @@ kgfm bench run --config large --encoder-weight-decay 0.01 --head-dropout 0.1
   （bert-base-multilingual-cased + `--proj-dim 256` の場合）
 - frozen エンコーダでは学習されるのが head だけなので、
   `--head-weight-decay` / `--head-dropout` のみが効きます（`--proj-dim` 必須）。
+
+---
+
+## 学習量の指定: `--max-steps` と `--max-epoch`
+
+step 数の代わりに**エポック数（小数可）**でも指定できます。
+
+```bash
+kgfm train --max-epoch 1    --train-list list_chembl/train.txt ...   # ちょうど 1 周
+kgfm train --max-epoch 0.25 ...                                      # コーパスの 1/4
+kgfm bench run --config xxlarge --max-epoch 0.5
+```
+
+```yaml
+defaults:
+  max_epoch: 1.0     # benchmarks/config_xxlarge.yaml はこれを使っています
+```
+
+**`--max-epoch` を指定すると `--max-steps` は無視されます。** step 数は
+
+```
+steps = ceil(max_epoch × epoch_examples / (batch_size × nproc × grad_accum))
+```
+
+で導出されるので、**バッチサイズや GPU 数を変えても 1.0 は 1 エポックのまま**
+です。DDP では train ファイルが `files[rank::world_size]` で分割され各 rank が
+互いに素な半分を読むため、`nproc` が分母に入るのは正しい挙動です
+（これまで 2 GPU では max_steps を手で半分にする必要がありました）。
+
+エポックのサイズは**実際に行数を数えて**求めます。ChEMBL のファイルは
+1.81 GB〜39 KB と不均一なので、1 ファイル分から掛け算すると 26% ずれます。
+
+- 約 1.3 GB/s で読むので 105 GiB の初回は約 5 分。以降は
+  `(パス, サイズ, mtime)` をキーに `~/.cache/kgfm/rowcounts.json` に
+  キャッシュされ即時になります（`KGFM_ROWCOUNT_CACHE` で変更可）。
+  サイズか mtime が変われば再カウントします。
+- `max_rows_per_file` と `row_keep_prob` はエポックサイズに反映されます
+  （`row_keep_prob < 1` のときは確率的なので期待値です）。
+- DDP では**シャードごとに測らず**エポックを均等割りします。シャードは
+  不均一ですが、全 rank が同じ step 数で回らないと集団通信がデッドロック
+  するためです。
+
+### ファイルはインターリーブして読む
+
+ChEMBL の TSV は activity ID で分割されているため、**1 ファイル = 1 つの
+エンティティ集団**です。以前は各ファイルを最後まで読んでから次に移っていました
+が、1 ファイルが 1000 万行あるので**どのファイルも読み終わりません** — 25k step
+/ B=512 の run が worker あたり 320 万行しか引かないので、85 ファイル中 4 つの
+先頭 32% しか見ないことになります。学習ストリームは 1 つの分布ではなく
+「分布の列」で、勾配は常に直近のファイルの偏りを追いかけていました。
+
+現在は既定で `interleave_chunk`（64）行ずつラウンドロビンに読みます
+(`interleave_files=True`)。**行の多重集合は完全に同一**で、順序だけが変わります。
+効果は集団の混合で、先頭 2000 行の平均 tail 長は連結読みで 26.6（1 ファイル目
+そのものの値）、インターリーブで 39.7（2 ファイルの中間）でした。
+
+以前の挙動が必要な場合だけ `--no-interleave-files` を渡してください。
+validation loss も既定でシャッフルしたストリーム上で測ります
+（`--no-valid-loss-shuffle` で無効化）— シャッフルしないと in-batch 負例が
+「たまたま隣にいた行」になってしまうためです。どちらも `kgfm train` と
+`kgfm bench cell` の両方にあり、config の `cells:` でセルごとに設定できます。
+
+なお `kgfm eval` の候補プールと filter index も同じデータセットを使うため、
+プールが 1 ファイルの先頭からではなく全ファイルから引かれるようになります。
+より代表的になりますが、**この変更以前の run の評価値とは比較できません**。
 
 ---
 
