@@ -32,6 +32,8 @@ from typing import Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
+from .scorers import Scorer, make_scorer
+
 LOSSES = ("contrastive", "softmax_ce", "bce", "margin", "self_adversarial")
 DEFAULT_LOSS = "contrastive"
 # Measured, on a 1500-step ngram probe at B=512 (valid loss / valid MRR):
@@ -42,23 +44,33 @@ DEFAULT_LOSS = "contrastive"
 DEFAULT_TEMPERATURE = 0.1
 
 
+# DistMult, so a caller that does not pass a scorer gets exactly the
+# behaviour this module had before scorers were pluggable.
+_DEFAULT_SCORER = make_scorer("distmult")
+
+
 def _l2(x: torch.Tensor) -> torch.Tensor:
     return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
 def in_batch_logits(
-    h: torch.Tensor, r: torch.Tensor, t: torch.Tensor, *, normalize: bool = False
+    h: torch.Tensor, r: torch.Tensor, t: torch.Tensor, *, normalize: bool = False,
+    scorer: Optional["Scorer"] = None,
 ) -> torch.Tensor:
     """``[B, B]`` score matrix: row i is (h_i, r_i) scored against every tail.
 
     With ``normalize`` the query and the tails are L2-normalized first, making
-    every entry a cosine similarity in [-1, 1]. That is a per-row positive
-    rescaling, so it leaves the induced ranking untouched.
+    every entry a cosine similarity in [-1, 1]. For an inner-product scorer
+    that is a per-row positive rescaling, so it leaves the induced ranking
+    untouched — **which is not true for a distance scorer**, where normalizing
+    moves the points and changes which tail is nearest. `contrastive` is
+    therefore an inner-product loss; see `compute_loss`.
+
+    ``scorer=None`` means DistMult, so callers written before the registry
+    keep their behaviour exactly.
     """
-    q = h * r
-    if normalize:
-        return _l2(q) @ _l2(t).t()
-    return q @ t.t()
+    sc = scorer if scorer is not None else _DEFAULT_SCORER
+    return sc.logits(h, r, t, normalize=normalize)
 
 
 def _targets(logits: torch.Tensor) -> torch.Tensor:
@@ -104,15 +116,24 @@ def _apply_mask(logits: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Ten
 def contrastive(
     h: torch.Tensor, r: torch.Tensor, t: torch.Tensor, *,
     temperature: float = DEFAULT_TEMPERATURE, label_smoothing: float = 0.0,
-    false_negative_mask: Optional[torch.Tensor] = None, **_: object,
+    false_negative_mask: Optional[torch.Tensor] = None,
+    scorer: Optional[Scorer] = None, **_: object,
 ) -> torch.Tensor:
     """InfoNCE / NT-Xent over in-batch negatives (the default).
 
     Softmax cross-entropy over *cosine* similarities scaled by 1/temperature,
     so the sharpness of the distribution is a hyperparameter instead of an
     emergent property of ‖r‖.
+
+    The normalization is what makes this an **inner-product** loss. With a
+    distance scorer (TransE, RotatE) L2-normalizing the query and the tails is
+    not a per-row rescaling — it moves the points, so it changes the ranking
+    rather than only the loss geometry. Those scorers are better paired with
+    `margin` or `self_adversarial`, which read the raw score; the benchmark in
+    benchmark_scorer/ keeps the loss fixed and says so rather than quietly
+    switching it per scorer.
     """
-    logits = _apply_mask(in_batch_logits(h, r, t, normalize=True) / temperature,
+    logits = _apply_mask(in_batch_logits(h, r, t, normalize=True, scorer=scorer) / temperature,
                          false_negative_mask)
     return F.cross_entropy(logits, _targets(logits), label_smoothing=label_smoothing)
 
@@ -120,21 +141,23 @@ def contrastive(
 def softmax_ce(
     h: torch.Tensor, r: torch.Tensor, t: torch.Tensor, *,
     label_smoothing: float = 0.0,
-    false_negative_mask: Optional[torch.Tensor] = None, **_: object,
+    false_negative_mask: Optional[torch.Tensor] = None,
+    scorer: Optional[Scorer] = None, **_: object,
 ) -> torch.Tensor:
     """Softmax cross-entropy on raw scores — no normalization, no temperature.
 
     Kept because it is what every result before this module was trained with,
     and because the contrast makes the calibration problem visible.
     """
-    logits = _apply_mask(in_batch_logits(h, r, t), false_negative_mask)
+    logits = _apply_mask(in_batch_logits(h, r, t, scorer=scorer), false_negative_mask)
     return F.cross_entropy(logits, _targets(logits), label_smoothing=label_smoothing)
 
 
 def bce(
     h: torch.Tensor, r: torch.Tensor, t: torch.Tensor, *,
     label_smoothing: float = 0.0,
-    false_negative_mask: Optional[torch.Tensor] = None, **_: object,
+    false_negative_mask: Optional[torch.Tensor] = None,
+    scorer: Optional[Scorer] = None, **_: object,
 ) -> torch.Tensor:
     """Binary cross-entropy per candidate — the "1-N scoring" of ConvE.
 
@@ -145,7 +168,7 @@ def bce(
     False negatives cannot be sent to -inf here — every cell is its own term,
     not a softmax competitor — so they are dropped from the mean instead.
     """
-    logits = in_batch_logits(h, r, t)
+    logits = in_batch_logits(h, r, t, scorer=scorer)
     target = torch.eye(logits.size(0), device=logits.device, dtype=logits.dtype)
     if label_smoothing:
         target = target * (1.0 - label_smoothing) + label_smoothing / logits.size(0)
@@ -159,7 +182,8 @@ def bce(
 def margin_ranking(
     h: torch.Tensor, r: torch.Tensor, t: torch.Tensor, *,
     margin: float = 1.0,
-    false_negative_mask: Optional[torch.Tensor] = None, **_: object,
+    false_negative_mask: Optional[torch.Tensor] = None,
+    scorer: Optional[Scorer] = None, **_: object,
 ) -> torch.Tensor:
     """Max-margin hinge: every negative must sit ``margin`` below the positive.
 
@@ -167,7 +191,7 @@ def margin_ranking(
     diagonal would dilute the loss by a factor of B/(B-1). False negatives are
     excluded from both the numerator and that pair count.
     """
-    logits = in_batch_logits(h, r, t)
+    logits = in_batch_logits(h, r, t, scorer=scorer)
     pos = logits.diagonal().unsqueeze(1)
     drop = _offdiag_mask(logits)
     if false_negative_mask is not None:
@@ -180,7 +204,8 @@ def margin_ranking(
 def self_adversarial(
     h: torch.Tensor, r: torch.Tensor, t: torch.Tensor, *,
     margin: float = 1.0, adversarial_temperature: float = 1.0,
-    false_negative_mask: Optional[torch.Tensor] = None, **_: object,
+    false_negative_mask: Optional[torch.Tensor] = None,
+    scorer: Optional[Scorer] = None, **_: object,
 ) -> torch.Tensor:
     """RotatE's self-adversarial negative sampling.
 
@@ -188,7 +213,7 @@ def self_adversarial(
     over the negatives' own scores, and are detached because they are sample
     weights, not part of the objective (Sun et al., 2019).
     """
-    logits = in_batch_logits(h, r, t)
+    logits = in_batch_logits(h, r, t, scorer=scorer)
     mask = _offdiag_mask(logits)
     if false_negative_mask is not None:
         # Excluded from the softmax *and* from the summed negative term: a

@@ -1,0 +1,173 @@
+# Model-size scaling law on a RANDOM MULTI-SOURCE corpus, not on ChEMBL.
+#
+# WHY THIS CONFIG EXISTS
+# config_scaling_scratch.yaml measures the size axis on `list_chembl`, which is
+# one domain: every row is a ChEMBL activity assertion, and one file is one
+# activity-ID population. A scaling exponent measured there could be a property
+# of that domain rather than of the task. This config runs the same axis on
+# `list_random` — 196 files drawn uniformly at random from all 22,886 TSVs under
+# data/, spanning 11 sources (uniprot, wikidata, biosampleplus, expressionatlas,
+# bioportal, biomodels, clinvar, oma, pubtator, chembl, pubmed). Same 6-column
+# contract everywhere, wildly different content.
+#
+# The list is bigger than ChEMBL's, which is the point of comparison:
+#   ChEMBL train      85 files   105.35 GiB   674,265,105 rows
+#   random train     150 files   119.80 GiB   720,653,921 rows
+# (valid 18 files / 33,116,566 and test 28 / 151,169,502, both also larger than
+# ChEMBL's. All counted with data.count_rows, not estimated. The size axis does
+# not actually depend on this — 24k steps x B=256 is under 0.01 of an epoch on
+# either corpus, so both are effectively infinite data here. What differs is
+# the *content*.)
+# Built by:
+#   python preprocess_list/make_lists.py --source all --sample-bytes 150GiB \
+#       --min-bytes 4096 --random-seed 0 --validate --out-dir list_random
+#
+# WHAT IS HELD IDENTICAL TO THE ChEMBL RUN, SO THE EXPONENTS ARE COMPARABLE
+#   the same seven `scratch-*` sizes, same B=256, same proj_dim, same head,
+#   same eval_every/valid_loss_batches, same weight decay.
+# WHAT DIFFERS, DELIBERATELY
+#   the lists, and max_steps (24000 here against 48000 there). The ChEMBL run's
+#   own curves can be re-fitted truncated to 24k for a matched-budget baseline
+#   — its cell logs hold every validation point — which is how the comparison
+#   is made honest without paying for 48k steps twice.
+#   `benchmark_scaling/compare_corpora.py` does that matching (common sizes,
+#   shorter budget) and prints the unmatched fits beside it so the effect of
+#   the matching is visible rather than assumed. Do not hardcode a baseline
+#   number here: it depends on which sizes both runs happen to have.
+#
+# LEARNING RATES ARE RE-PROBED ON THIS CORPUS, NOT COPIED FROM ChEMBL.
+# A tolerated rate is a property of (architecture, corpus), so reusing ChEMBL's
+# would confound "this corpus scales differently" with "ChEMBL's rate suits it
+# worse" — the same mistake benchmark_scaling/README.md documents for the size
+# axis. Run, in order:
+#   bash benchmark_scaling/run_lr_probe_random.sh         # 3e-6 .. 1e-4, 5 sizes
+#   bash benchmark_scaling/run_lr_probe_random_extend.sh  # 3e-4, 1e-3 upward
+#   bash benchmark_scaling/run_lr_probe_random_large.sh   # xl + large, 1/GPU
+# and paste the merged `cells:` block below. The upward extension is not
+# optional: on this corpus the first grid returned its *top* value for the two
+# smallest sizes, which is a bound rather than an optimum.
+#
+# COST: ~16 h of GPU time for all seven cells at 24k steps (the five small
+# ones measured 6.21 h; xl and large add roughly 3.5 h and 5 h). Split over two
+# cards it is about 8 h of wall clock. `--resume` skips cells whose JSON is
+# already in the run directory, so the two large cells can be added to an
+# existing five-cell run instead of repeating it.
+#
+#   bash benchmark_scaling/run_scaling_random.sh
+
+run_label: scaling_random
+results_root: benchmark_scaling/results/random
+
+# --- run-level ---
+train_list: list_random/train.txt
+valid_list: list_random/valid.txt
+test_list: list_random/test.txt
+
+# Only feeds `kgfm bench prep` (the KG for ULTRA/MOTIF), which this study does
+# not read. Kept at the other studies' value for a comparable run directory.
+prep_max_train: 400000
+prep_max_valid: 12000
+prep_max_test: 12000
+
+# The full random-init family, 4.4M -> 335.4M (1.9 decades of N), same seven
+# sizes as config_scaling_scratch.yaml so the two corpora are compared over an
+# identical size range.
+#
+# `scratch-large` fits at B=256 on this corpus: activation memory is set by
+# padded sequence length, and that is **the same on both corpora** — measured
+# 76,214 tokens/step here against 76,178 on ChEMBL, i.e. 99.2 of the 128-token
+# cap either way, because both sets of RDF URIs are long enough to saturate it.
+# So ChEMBL's measured train_peak of 101.81 GiB of 139.8 carries over. Do not
+# infer this from character counts (uniprot text is ~50% longer than ChEMBL's);
+# the tokenizer output is what matters and it is identical.
+encoders:
+  - scratch-tiny
+  - scratch-mini
+  - scratch-small
+  - scratch-medium
+  - scratch-base
+  - scratch-xl
+  - scratch-large
+heads: [linear]
+freezes: ["off"]
+protocols: [pooled]
+
+# --- every cell ---
+defaults:
+  max_steps: 24000        # x 256 = 6,144,000 examples per cell
+  batch_size: 256
+  proj_dim: 256
+
+  # These ARE the scaling data points, so they are dense: 96 per cell.
+  eval_every: 250
+  valid_loss_batches: 8
+  log_every: 100
+
+  encoder_weight_decay: 0.01
+  head_weight_decay: 0.0
+
+  n_eval_triples: 6000
+  pool_size: 6000
+  max_filter_tails: 460000
+  max_filter_rows: 10000000
+
+# Per-size learning rates, MEASURED ON THIS CORPUS by
+# `bash benchmark_scaling/run_lr_probe_random.sh` +
+# `run_lr_probe_random_extend.sh` (2000 steps, B=256, these exact cell
+# settings). Every value is an interior optimum, not a grid edge.
+#
+# Best validation loss per (size, rate). `coll` = within 0.5% of
+# ln(256)=5.5452, i.e. the model never left the random-guess fixed point:
+#
+#              3e-7    1e-6    3e-6    1e-5    3e-5    1e-4    3e-4    1e-3
+#   tiny         --      --   4.7489  4.2007  3.5048  3.2943 [3.2089] 3.4213
+#   mini         --      --   4.4018  3.7590  3.3329 [3.1472] 3.1766   coll
+#   small        --      --   4.2812  3.4420 [3.3365] 3.4188   coll     coll
+#   medium       --      --   3.9207  3.3634 [3.3008] 3.4382   coll     coll
+#   base         --      --   3.6086  3.2911 [3.1648]  coll     coll     coll
+#   xl           --      --   3.5606 [3.2847]  coll     coll     --       --
+#   large      4.2565  3.7570 [3.4823] 3.6747   coll     coll     --       --
+#
+# COMPARE WITH ChEMBL (config_scaling_scratch.yaml): 1e-4 / 3e-5 / 1e-5 /
+# 3e-5 / 1e-5 / 1e-5 / 3e-6 for the same seven sizes.
+#
+#   size     random   ChEMBL   ratio
+#   tiny       3e-4     1e-4    3.0x
+#   mini       1e-4     3e-5    3.3x
+#   small      3e-5     1e-5    3.0x
+#   medium     3e-5     3e-5    1.0x
+#   base       3e-5     1e-5    3.0x
+#   xl         1e-5     1e-5    1.0x
+#   large      3e-6     3e-6    1.0x
+#
+# **The shift is 3x (half a decade), not a decade, and only at four of the
+# seven sizes** — medium, xl and large want exactly what they want on ChEMBL.
+# Reading the four small sizes alone would suggest "this corpus tolerates a
+# decade more", and the two largest disprove it: whatever makes this corpus
+# tolerate a larger step does not survive into the large models. Still, the
+# 3x matters: rates that collapse BERT on ChEMBL (mini at 3e-4, small at 1e-4)
+# train fine here, so reusing ChEMBL's rates would have run four of seven
+# cells at a third of their optimum and flattened the exponent in a way that
+# looked like a corpus effect.
+#
+# Loss and MRR pick the same rate for tiny/mini/small/medium/large. They
+# disagree for `scratch-base` (loss 3e-5 -> 3.1648, MRR 1e-5 -> 0.5455 against
+# 0.5338 at 3e-5) and for `scratch-xl` (loss 1e-5, MRR 1e-5 — agreeing) —
+# selection is on loss per benchmark_scaling/README.md, because a rate is
+# tuned against what the optimizer minimizes. The disagreement is reported
+# rather than resolved by switching criteria.
+cells:
+  scratch-tiny:
+    lr: 0.0003
+  scratch-mini:
+    lr: 0.0001
+  scratch-small:
+    lr: 3e-05
+  scratch-medium:
+    lr: 3e-05
+  scratch-base:
+    lr: 3e-05
+  scratch-large:
+    lr: 3e-06
+  scratch-xl:
+    lr: 1e-05

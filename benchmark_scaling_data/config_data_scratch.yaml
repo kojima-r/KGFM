@@ -1,0 +1,110 @@
+# Dataset-size scaling law — randomly-initialised transformer. The headline.
+#
+# Same axis as config_data_ngram.yaml (`data_sizes` = max_rows_per_file), a
+# different model. Read the two side by side: the ngram cells are a 268M-entry
+# lookup table and the scratch cells are a real 41M-parameter transformer, so
+# the difference between their exponents is the difference between memorising
+# a finite pool and learning from it.
+#
+# WHY scratch-medium AND NOT A PRETRAINED ENCODER
+# A pretrained encoder already absorbed a corpus, so "unique data" would mean
+# "unique ChEMBL data on top of an unmeasured amount of pretraining" and the
+# left-hand end of the axis would be flat for reasons that have nothing to do
+# with D. `scratch-medium` (8x512, 41.4M, `random_init: True` -> no weights
+# downloaded) starts from nothing, which is what makes D the only source of
+# information in the run.
+#
+# WHY THIS SIZE
+# It is the largest cell in benchmark_scaling/ that is still cheap enough for
+# an 8-cell sweep (2.5 h at 48k steps; ~1.3 h at this config's 24k), and the
+# 2026-08-26 model-size run showed it is past the near-degenerate 4-layer
+# cells — doubling depth from scratch-small moved the loss where doubling
+# width did not.
+#
+# THE LEARNING RATE IS FIXED AT ITS PROBED VALUE AND THAT IS DELIBERATE.
+# 3e-5 is `scratch-medium`'s optimum from benchmark_scaling/lr_probe.py
+# (2000 steps, B=256, best validation loss: 1e-5 -> 3.1837, 3e-5 -> 3.1714,
+# 1e-4 -> 3.2959, 3e-4 and above -> collapse to the ln(256)=5.5452
+# random-guess line). It was probed on the *uncapped* corpus, so a small-D
+# cell might individually prefer a different rate — but re-tuning per cell
+# would confound "less data" with "a rate that happened to suit less data",
+# which is precisely the mistake the model-size study documents at length.
+# One rate across the axis is the controlled comparison; if the small-D cells
+# look pathological rather than merely overfitted, probe them before
+# concluding anything.
+#
+#   bash benchmark_scaling_data/run_data_scratch.sh
+# Budget: 8 cells x ~1.3 h ~= 11 h on one H200.
+
+run_label: data_scaling_scratch
+results_root: benchmark_scaling_data/results/chembl
+
+# --- run-level ---
+prep_max_train: 400000
+prep_max_valid: 12000
+prep_max_test: 12000
+
+encoders: [scratch-medium]
+heads: [linear]
+freezes: ["off"]
+protocols: [pooled]
+
+# --- THE AXIS ---
+# Unique rows D = sum_f min(rows(f), cap), measured (15 of 85 train files are
+# smaller than the top caps, so `85 x cap` is up to 10% high). Against this
+# config's 6,144,000 examples per cell:
+#
+#     cap    D (counted)   passes over D
+#       100        8,500         722.8
+#       300       25,421         241.7
+#     1,000       83,521          73.6
+#     3,000      247,322          24.8
+#    10,000      807,680           7.6
+#    30,000    2,377,999           2.6
+#   100,000    7,732,879           0.80
+#      null  674,265,105           0.009   <- reference anchor only
+#
+# Six of eight cells complete at least one pass. Two do not, and the report
+# says so: for those, D is not the binding constraint (the step budget is), so
+# they measure compute rather than data. They are kept because the two of them
+# bracket the floor the saturating fit needs — but a plain `a*D^b` fitted
+# through a flat tail comes back too shallow, which is why both fits are
+# always reported.
+data_sizes: [100, 300, 1000, 3000, 10000, 30000, 100000, null]
+
+# --- every cell ---
+defaults:
+  # FIXED ACROSS CELLS. Same compute, same optimizer steps, same number of
+  # in-batch negatives. Only the size of the pool changes.
+  #
+  # 24000 rather than benchmark_scaling's 48000: this sweep has eight cells
+  # rather than seven and the question is different. A data-scaling law needs
+  # its small-D cells to reach and pass their optimum (they do so within a
+  # few thousand steps, because they run out of data long before they run out
+  # of budget), not to squeeze the last 0.05 nats out of the large-D end.
+  # The trade-off is that the two largest cells stay budget-limited — stated
+  # above, and recomputed by the report from the run itself.
+  max_steps: 24000        # x 256 = 6,144,000 examples per cell
+  batch_size: 256
+  proj_dim: 256
+
+  # Measured optimum for this encoder; see the note at the top of the file.
+  lr: 3.0e-5
+
+  # These ARE the data points. Dense on purpose: an eval costs ~4 s against
+  # ~150 s of training per 250 steps, and the mid-run turn-up that the small-D
+  # cells show is only visible at this resolution.
+  eval_every: 250
+  valid_loss_batches: 8
+  log_every: 100
+
+  # Matches benchmark_scaling/config_scaling_scratch.yaml so the two studies
+  # differ in their axis alone. There are no pretrained weights to protect
+  # here; the value is kept nonzero only for that comparability.
+  encoder_weight_decay: 0.01
+  head_weight_decay: 0.0
+
+  n_eval_triples: 6000
+  pool_size: 6000
+  max_filter_tails: 460000
+  max_filter_rows: 10000000

@@ -1,0 +1,106 @@
+# Dataset-size scaling law — ngram encoder, the cheap sweep.
+#
+# THE QUESTION
+# `benchmark_scaling/` asks "what does more capacity buy?" (N varies, data
+# effectively unlimited). This asks the other one: "what does more *unique
+# data* buy?" — the model is held fixed and `max_rows_per_file` varies, so
+# every cell trains the same architecture for the same number of steps on a
+# differently-sized pool.
+#
+# WHY max_rows_per_file AND NOT FEWER FILES
+# ChEMBL is partitioned by activity ID, so one file is one entity population.
+# Dropping files would shrink the data *and* the number of populations, which
+# are two different axes (benchmarks/README.md: the second GPU buys diversity,
+# not volume). Capping rows per file keeps all 85 files in the round-robin
+# rotation and changes only the rows per population, so D is the only thing
+# that moves.
+#
+# WHY THE CORPUS HAS TO BE CAPPED AT ALL
+# Without a cap the pool is 674,265,105 rows against 10.2M examples in this
+# budget — 0.015 of a pass, so no row is ever seen twice and "more data" and
+# "more steps" are the same variable. Capping makes the pool finite; the
+# training loop then re-opens the loader when it runs out
+# (`while step < max_steps: for batch in loader`) and revisits the same rows.
+# That repetition is the effect being measured, not a bug.
+#
+# HOW TO READ IT
+# The report fits one point per cell (its BEST validation loss) against D:
+#   L(D) = L_inf + a * D^b
+# Best rather than final because a finite-data run overfits — the final value
+# says how long it was left running past its optimum, the minimum says what
+# that much data can buy.
+#
+#   bash benchmark_scaling_data/run_data_ngram.sh
+
+run_label: data_scaling_ngram
+results_root: benchmark_scaling_data/results/chembl
+
+# --- run-level ---
+# Only feeds `kgfm bench prep` (the KG for ULTRA/MOTIF), which this study does
+# not use. Kept at the other studies' value so the run dir is comparable.
+prep_max_train: 400000
+prep_max_valid: 12000
+prep_max_test: 12000
+
+# One model, fixed. ngram is ~21,000 ex/s at B=512, which is what makes an
+# 8-cell sweep a two-hour job instead of a two-day one. Its 268M parameters
+# are an EmbeddingBag (a lookup table), so it has ample capacity to memorise
+# the small-D cells — which is exactly the regime this study needs to reach.
+encoders: [ngram]
+heads: [linear]
+freezes: ["off"]
+protocols: [pooled]
+
+# --- THE AXIS ---
+# `max_rows_per_file`. Unique rows D is `sum_f min(rows(f), cap)`, MEASURED —
+# not `85 x cap`. 15 of the 85 train files are small (253 rows to 599k), so
+# the product overestimates D by up to 10% at the top of this ladder and the
+# report counts instead (`data.count_rows`, cached on disk).
+#
+# Against this config's 10,240,000 examples per cell:
+#
+#     cap    D (counted)   passes over D
+#       100        8,500        1204.7
+#       300       25,421         402.8
+#     1,000       83,521         122.6
+#     3,000      247,322          41.4
+#    10,000      807,680          12.7
+#    30,000    2,377,999           4.3
+#   100,000    7,732,879           1.3
+#      null  674,265,105           0.015   <- reference, see below
+#
+# 4.9 decades of D, and seven of the eight cells revisit their data at least
+# once. The uncapped cell is deliberately included as ONE right-hand anchor:
+# it never repeats a row, so it does not measure data at all — it measures
+# what this budget achieves with effectively unlimited data, which is the
+# floor L_inf should approach. One such cell identifies the floor; several
+# would be a flat tail that drags the plain-power-law exponent toward zero
+# (the same failure `fit_saturating` exists to handle on the compute axis).
+# The report states which cells completed a pass, so this stays visible.
+data_sizes: [100, 300, 1000, 3000, 10000, 30000, 100000, null]
+
+# --- every cell ---
+defaults:
+  # FIXED ACROSS CELLS — this is what makes the axis clean. Same steps, same
+  # batch, same number of in-batch negatives (B-1), same optimizer. Only the
+  # pool the batches are drawn from differs.
+  max_steps: 20000        # x 512 = 10,240,000 examples per cell
+  batch_size: 512
+  proj_dim: 256           # collapses to Identity at ngram's own width, so free
+
+  # These ARE the data points the trajectories are read from, so they are
+  # dense. `valid_loss_batches > 0` is mandatory: it is the y-axis.
+  eval_every: 250
+  valid_loss_batches: 8
+  log_every: 100
+
+  # ngram's EmbeddingBag *is* its encoder and it trains from scratch, so
+  # decaying it would change the model rather than regularise a pretrained
+  # one. Left at 0, as in config_xlarge_compare.yaml.
+  encoder_weight_decay: 0.0
+  head_weight_decay: 0.0
+
+  n_eval_triples: 6000
+  pool_size: 6000
+  max_filter_tails: 460000
+  max_filter_rows: 10000000

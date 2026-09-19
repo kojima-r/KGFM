@@ -583,16 +583,25 @@ bash benchmarks/run_chembl.sh --max-steps 1000   # config_small.yaml の max_ste
 
 | 階層 | 何を書くか | 例 |
 |---|---|---|
-| トップレベル | **run 全体**の設定。セルごとに変えられない | `prep_max_train`, `encoders`, `heads`, `freezes`, `protocols`, `nproc` |
+| トップレベル | **run 全体**の設定。セルごとに変えられない | `prep_max_train`, `encoders`, `heads`, `freezes`, `data_sizes`, `protocols`, `nproc` |
 | `defaults:` | **全セル共通**のセル設定 | `max_steps`, `batch_size`, `proj_dim` |
 | `cells: <tag>:` | **そのセルだけ**の設定 | `transformer: {batch_size: 64}` |
 
 どちらの階層に属するかは `kgfm/bench/config.py` の `CELL_FIELDS` が唯一の
 定義で、間違った階層に書くと「どこに書くべきか」を示すエラーになります。
 
-`<tag>` は `<encoder>[_<head>][_frozen]`（`sweep.cell_tag` と同じ。`_<head>` は
-`heads` が 2 つ以上のときだけ付く）で、`encoders × heads × freezes` が実際に
-生成するセルでなければエラーになります。
+`<tag>` は `<encoder>[_<head>][_d<size>][_frozen]`（`BenchConfig.cell_specs`
+が唯一の定義）で、`encoders × heads × freezes × data_sizes` が実際に生成する
+セルでなければエラーになります。**`_<head>` と `_d<size>` はその軸を 2 つ以上
+振ったときだけ付く**ので、軸を 1 つも増やしていない config のタグ（および
+結果 JSON のファイル名）は変わりません。
+
+`data_sizes` は**データ量軸**です（`max_rows_per_file` の値を並べる。`null`
+＝上限なし）。全セルが同じ encoder になる実験ではこれが無いとタグが全部
+衝突するため、`heads` と同じ形の sweep 軸として追加してあります。使い方は
+`benchmark_scaling_data/README.md` を参照してください。軸の値は
+`defaults:` に勝ち、`cells: <tag>:` と CLI には負けます（軸の値はそのセルを
+そのセルたらしめている値なので `defaults:` より強い、という順序です）。
 
 > **`prep_max_*` は kgfm の学習量ではありません。** これは `kgfm bench prep`
 > が作る entity-ID KG（ULTRA / MOTIF が読むもの）の行数上限です。kgfm 自身は
@@ -670,6 +679,7 @@ cell transformer_frozen  max_steps=25000 batch_size=512 eval_every=2500 proj_dim
 | `--protocols LIST` | `pooled,filtered` | 最終評価プロトコルのスイープ |
 | `--encoders LIST` | `ngram,transformer` | エンコーダのスイープ |
 | `--freezes LIST` | `off` | 凍結モードのスイープ。`off,on` を渡すと、各 transformer エンコーダについて「フル fine-tune」「凍結 + 射影頭のみ学習」の両方を回す。`ngram` の `on` 変種は no-op なので暗黙にスキップ |
+| `--data-sizes LIST` | なし | **データ量軸**。`max_rows_per_file` の値を並べる（`all`/`null` = 上限なし）。2 つ以上でセルタグに `_d<size>` が付く。全セル共通の単一上書きである `--max-rows-per-file` とは別物 |
 | `--nproc N` | 1 | kgfm セル 1 つあたりの GPU 数。>1 で torchrun 起動 |
 | `--max-filter-tails N` | 50000 | filtered 時の候補語彙上限 |
 | `--max-filter-rows N`  | 1000000 | filtered 時の読み取り行上限 |

@@ -59,7 +59,23 @@ _EVAL_RE = re.compile(r"^\[(\w+) eval @ step (\d+)\]\s*(\{.*\})\s*$")
 # rather than positionally — a strict pattern silently emptied encoder_info.
 _INIT_RE = re.compile(
     r"^\[init\] encoder=(\S+).*?dim=(\d+) params total=([\d,]+)"
-    r"(?: trainable=([\d,]+))?"
+    # `head_params=` is the projection-head count. The alternation accepts the
+    # short-lived `head=` spelling too, because the line already carries
+    # `head=<type>` and the two were ambiguous — logs written in that window
+    # still parse, and the numeric alternative cannot match the type name.
+    r"(?: trainable=([\d,]+))?(?: head_params=([\d,]+)| head=([\d,]+)(?!\w))?"
+)
+# head_mode / scorer, added when they became choices. Optional throughout, so
+# a log written before them parses unchanged and reads as shared / distmult.
+_HEAD_MODE_RE = re.compile(r"^\[init\] encoder=\S+.*? head_mode=(\S+)")
+_SCORER_RE = re.compile(r"^\[init\] encoder=\S+.*? scorer=(\S+)")
+# "[init] data cap: max_rows_per_file=100000 row_keep_prob=1 train_files=85"
+# How much *unique* data the cell could reach — the x-axis of the dataset-size
+# study. `None` for the cap means uncapped, which is why the value is matched
+# as a word rather than as digits.
+_DATA_CAP_RE = re.compile(
+    r"^\[init\] data cap: max_rows_per_file=(\S+) row_keep_prob=([\d.eE+-]+)"
+    r" train_files=(\d+)"
 )
 
 
@@ -86,8 +102,21 @@ class TrainingCurve:
     encoder_name: str = ""
     params_total: Optional[int] = None
     params_trainable: Optional[int] = None
+    # Projection-head parameters only. Not derivable from the two above: with
+    # a fine-tuned encoder `trainable` is everything, and head_mode=separate
+    # changes only this number.
+    params_head: Optional[int] = None
+    head_mode: Optional[str] = None
+    scorer: Optional[str] = None
     global_batch_size: Optional[int] = None
     world_size: Optional[int] = None
+    # Unique-data caps, straight from the `[init] data cap:` line. `None`
+    # throughout for logs written before that line existed; a dataset-size
+    # report has to say "unknown" rather than assume "uncapped", because the
+    # two are the same value (no cap) yet mean opposite things about the run.
+    max_rows_per_file: Optional[int] = None
+    row_keep_prob: Optional[float] = None
+    train_files: Optional[int] = None
 
     @property
     def evals(self) -> List[Tuple[int, float]]:
@@ -153,6 +182,13 @@ def parse_training_log(path: Path) -> TrainingCurve:
             if w:
                 curve.world_size = int(w.group(1))
             continue
+        m = _DATA_CAP_RE.match(line)
+        if m:
+            cap = m.group(1)
+            curve.max_rows_per_file = None if cap == "None" else int(cap)
+            curve.row_keep_prob = float(m.group(2))
+            curve.train_files = int(m.group(3))
+            continue
         m = _EVAL_RE.match(line)
         if m:
             try:
@@ -181,6 +217,15 @@ def parse_training_log(path: Path) -> TrainingCurve:
             curve.params_total = int(m.group(3).replace(",", ""))
             if m.group(4):
                 curve.params_trainable = int(m.group(4).replace(",", ""))
+            head_n = m.group(5) or m.group(6)
+            if head_n:
+                curve.params_head = int(head_n.replace(",", ""))
+            hm = _HEAD_MODE_RE.match(line)
+            if hm:
+                curve.head_mode = hm.group(1)
+            sc = _SCORER_RE.match(line)
+            if sc:
+                curve.scorer = sc.group(1)
             curve.encoder_info = f"{m.group(1)}, dim={m.group(2)}, {m.group(3)} params"
     return curve
 
@@ -230,6 +275,16 @@ def _row(record: Dict[str, Any]) -> Dict[str, str]:
         head = record.get("head")
         if head and head != "auto":
             encoder = f"{encoder}, {head}"
+        # Same rule for the head wiring and the scoring function: name them
+        # only when they are not the default, so every run predating those
+        # options keeps the label it had, and a sweep over them cannot
+        # collapse two cells onto one row.
+        mode = record.get("head_mode")
+        if mode and mode != "shared":
+            encoder = f"{encoder}, {mode}"
+        scorer = record.get("scorer")
+        if scorer and scorer != "distmult":
+            encoder = f"{encoder}, {scorer}"
         # Distinguish frozen-LM rows so the table doesn't collapse them onto
         # the fine-tuned cells of the same encoder.
         if record.get("freeze_encoder"):

@@ -34,10 +34,15 @@ def run_step(cfg: BenchConfig, out_dir: Path, logger: RunLogger) -> List[Path]:
     )
     logger.log(f"    python={kgfm[0]} nproc={cfg.nproc}")
 
-    # cell_specs() owns which (encoder, head, freeze) combinations are real
-    # cells and what each is called, so the sweep and the config agree on the
-    # cell list by construction rather than by two copies of the same rule.
-    for encoder, head, freeze, tag in cfg.cell_specs():
+    # cell_specs() owns which (encoder, head, freeze, data_size) combinations
+    # are real cells and what each is called, so the sweep and the config agree
+    # on the cell list by construction rather than by two copies of the same
+    # rule. `data_size` reaches the cell through resolve_cell(tag), not from
+    # here, because it is a cell-level setting that happens to be decided by
+    # the axis.
+    for spec in cfg.cell_specs():
+        encoder, head, freeze, tag = (
+            spec.encoder, spec.head, spec.freeze, spec.tag)
         ckpt_dir = out_dir / f"kgfm_ckpts_{tag}"
         # defaults: <- cells: <tag>: <- CLI flags, resolved once per cell.
         cell = cfg.resolve_cell(tag)
@@ -84,6 +89,10 @@ def run_step(cfg: BenchConfig, out_dir: Path, logger: RunLogger) -> List[Path]:
             ]
             if freeze == "on":
                 cell_args.append("--freeze-encoder")
+            # These two come off the spec, not resolve_cell: they are sweep
+            # axes, so the cell's identity carries them.
+            cell_args += ["--head-mode", spec.head_mode,
+                          "--scorer", spec.scorer]
             for flag, key in (
                 ("--lr", "lr"),
                 ("--loss", "loss"),

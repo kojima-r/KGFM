@@ -1,0 +1,73 @@
+# Dataset-size scaling study, smoke scale — proves the pipeline in minutes.
+#
+# Same two-level layout as benchmarks/config_*.yaml. The one thing that makes
+# this a *data* study rather than a model study is the `data_sizes:` axis:
+# every cell is the same encoder and what varies is `max_rows_per_file`, i.e.
+# how much UNIQUE data the cell can reach.
+#
+# WHY max_rows_per_file IS THE KNOB
+# The corpus is effectively infinite next to any training budget (674M train
+# rows against 12M examples in a 48k-step run at B=256), so "more steps" and
+# "more data" are the same thing and no finite-data effect can appear. Capping
+# rows per file makes the pool finite while keeping ALL 85 files in the
+# round-robin rotation, so the number of entity populations is constant and
+# only the number of rows per population changes. Using fewer *files* instead
+# would confound data volume with population diversity, which is a different
+# axis (see benchmarks/README.md on what the second GPU buys).
+#
+# The training loop re-opens the loader when it runs out
+# (`while step < max_steps: for batch in loader`), so a capped cell simply
+# revisits its pool. That repetition is the whole point: it is what produces
+# the overfitting the data axis is there to measure.
+
+run_label: data_scaling_small
+results_root: benchmark_scaling_data/results/chembl
+
+# --- run-level ---
+prep_max_train: 50000
+prep_max_valid: 2000
+prep_max_test: 2000
+
+# One model, held fixed. ngram here because it is ~17,000 ex/s and this config
+# exists to be fast; the real study picks its model deliberately.
+encoders: [ngram]
+heads: [linear]
+freezes: ["off"]
+protocols: [pooled]
+
+# THE AXIS. Rows per file; tags become ngram_d5 / ngram_d50 / ngram_d500.
+# Unique rows D is `sum_f min(rows(f), cap)` and is COUNTED, not `85 x cap` —
+# 15 of the 85 ChEMBL train files hold fewer than 600k rows (the smallest has
+# 253), so the product is wrong at the top of the ladder.
+#
+# These three caps are chosen to straddle one pass at this config's 12,800
+# examples, so the smoke run demonstrates the actual shape of the study rather
+# than three points that all sit in the no-repetition regime:
+#
+#     cap    D      passes over D
+#       5      425      30.1
+#      50    4,250       3.0
+#     500   42,021       0.30
+#
+# The report's regime note should therefore say two of three cells reached the
+# repetition regime and one did not. If it says something else, the caps or
+# the budget drifted apart.
+data_sizes: [5, 50, 500]
+
+# --- every cell ---
+defaults:
+  # Fixed for every cell, which is what makes the axis clean: same compute,
+  # same optimizer steps, same number of in-batch negatives. Only the size of
+  # the pool those batches are drawn from changes.
+  max_steps: 200          # x 64 = 12,800 examples per cell
+  batch_size: 64
+  proj_dim: 256
+
+  eval_every: 20
+  valid_loss_batches: 4
+  log_every: 10
+
+  n_eval_triples: 500
+  pool_size: 500
+  max_filter_tails: 5000
+  max_filter_rows: 100000

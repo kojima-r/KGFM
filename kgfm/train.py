@@ -48,7 +48,9 @@ from .losses import (
     compute_loss,
     duplicate_tail_mask,
 )
-from .heads import DEFAULT_HEAD, HEADS, is_trainable
+from .heads import (DEFAULT_HEAD, DEFAULT_HEAD_MODE, HEAD_MODES, HEADS,
+                    is_trainable)
+from .scorers import DEFAULT_SCORER, SCORERS, is_distance
 from .model import DistMultScorer
 from .utils import pick_free_gpu
 
@@ -78,6 +80,11 @@ class TrainConfig:
     proj_dim: Optional[int] = None
     # Projection head between encoder and score; see kgfm/heads.py.
     head: str = DEFAULT_HEAD
+    # Whether h, r and t share one head or get one each. `shared` is what
+    # every result before this option was trained with.
+    head_mode: str = DEFAULT_HEAD_MODE
+    # Scoring function over the three vectors; see kgfm/scorers.py.
+    scorer: str = DEFAULT_SCORER
     # Loader
     max_text_len: int = 512
     batch_size: int = 256
@@ -247,6 +254,19 @@ def make_loader(files, cfg: TrainConfig, *, train: bool,
     no model can separate, which puts a floor under the number and compresses
     the differences between models. Measured on one checkpoint: 4.73
     unshuffled versus 4.35 shuffled.
+
+    **Both row-subsampling knobs are training-only.** ``row_keep_prob`` and
+    ``max_rows_per_file`` exist to bound how much of a multi-TB corpus one
+    training run consumes; applying either to the validation stream would
+    change *what is being measured* instead. That matters as soon as
+    ``max_rows_per_file`` is swept as an axis (``benchmark_scaling_data/``):
+    with the cap applied to valid too, every cell measured its loss on a
+    differently-sized held-out pool, so the losses were not comparable — and
+    the smallest cells had fewer valid rows than one batch, so
+    ``evaluate_loss`` skipped every short batch and returned None, leaving
+    those cells with no y-axis at all. ``kgfm/eval.py`` never applied the cap
+    to its candidate pool or filter index either, so this also makes the loss
+    path and the metric path agree on the held-out set.
     """
     if shuffle is None:
         shuffle = train
@@ -258,7 +278,7 @@ def make_loader(files, cfg: TrainConfig, *, train: bool,
         interleave_files=cfg.interleave_files,
         max_text_len=cfg.max_text_len,
         seed=cfg.seed,
-        max_rows_per_file=cfg.max_rows_per_file,
+        max_rows_per_file=cfg.max_rows_per_file if train else None,
     )
     return DataLoader(
         ds,
@@ -306,6 +326,11 @@ def in_batch_negative_loss(
         duplicate_tail_mask(batch["t_text"], device)
         if mask_duplicate_tails else None
     )
+    # The loss builds its own [B, B] matrix, so it needs the same scoring
+    # function the model uses. Reaching through the DDP wrapper for it is safe
+    # — unlike the forward pass, this is a read of a stateless module, not a
+    # path that has to arm the gradient reducer.
+    inner = getattr(scorer, "module", scorer)
     return compute_loss(
         loss, h, r, t,
         temperature=loss_temperature,
@@ -313,6 +338,7 @@ def in_batch_negative_loss(
         adversarial_temperature=adversarial_temperature,
         label_smoothing=label_smoothing,
         false_negative_mask=fn_mask,
+        scorer=getattr(inner, "scorer", None),
     )
 
 
@@ -572,6 +598,19 @@ def train(cfg: TrainConfig) -> None:
         mprint(f"[init] max_epoch={cfg.max_epoch:g} -> max_steps={steps:,} "
                f"({steps * global_bs:,} examples over {len(train_files)} files)")
         cfg.max_steps = steps
+    # How much *unique* data this run can reach. Logged unconditionally and
+    # before sharding, because it is the x-axis of the dataset-size scaling
+    # study (`benchmark_scaling_data/`) and nothing else in the log records it:
+    # `max_rows_per_file` truncates every file independently, so the pool is
+    # `sum_f min(rows(f), cap)` and no amount of `max_steps` reaches past it —
+    # the training loop just re-opens the loader and sees the same rows again.
+    # Only the caps and the file count are printed, never the row total: that
+    # would need a full count of the corpus (~5 min for 105 GiB on a cold
+    # cache) on every single run. The report resolves the total itself from
+    # `data.count_rows`, which is cached.
+    mprint(f"[init] data cap: max_rows_per_file={cfg.max_rows_per_file} "
+           f"row_keep_prob={cfg.row_keep_prob:g} "
+           f"train_files={len(train_files)}")
     if ds.world_size > 1:
         # Shard train files across ranks. Slicing by rank::world_size keeps
         # the count balanced and the global ordering deterministic. Eval
@@ -600,6 +639,7 @@ def train(cfg: TrainConfig) -> None:
     scorer_raw = DistMultScorer(
         encoder, proj_dim=cfg.proj_dim, normalize=True,
         head_dropout=cfg.head_dropout, head=cfg.head,
+        head_mode=cfg.head_mode, scorer=cfg.scorer,
     ).to(device)
 
     # ---- Resume: load model state BEFORE DDP wrap so DDP's initial
@@ -618,10 +658,18 @@ def train(cfg: TrainConfig) -> None:
             scorer_raw.load_state_dict(resumed_payload["model_state"], strict=False)
 
     n_total = sum(p.numel() for p in scorer_raw.parameters())
+    n_head = sum(p.numel() for p in scorer_raw.head_parameters())
     n_trainable = sum(p.numel() for p in scorer_raw.parameters() if p.requires_grad)
     mprint(
-        f"[init] encoder={cfg.encoder} head={cfg.head} dim={scorer_raw.dim} "
-        f"params total={n_total:,} trainable={n_trainable:,}"
+        f"[init] encoder={cfg.encoder} head={cfg.head} "
+        f"head_mode={cfg.head_mode} scorer={cfg.scorer} dim={scorer_raw.dim} "
+        f"params total={n_total:,} trainable={n_trainable:,} "
+        # Logged separately because it cannot be derived from the other two:
+        # with a fine-tuned encoder everything is trainable, so `trainable`
+        # says nothing about the head, and head_mode=separate triples exactly
+        # this number while leaving the encoder alone. A head-mode comparison
+        # needs it to say whether a win came from the wiring or the capacity.
+        f"head_params={n_head:,}"
     )
 
     # Wrap with DDP only when there are trainable params to sync — DDP
@@ -974,6 +1022,19 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
                         f"(default: {DEFAULT_HEAD}, which is Identity when "
                         f"--proj-dim matches the encoder width and Linear "
                         f"otherwise). See kgfm/heads.py.")
+    p.add_argument("--head-mode", default=DEFAULT_HEAD_MODE,
+                   choices=list(HEAD_MODES),
+                   help=f"Whether h, r and t share one projection head or get "
+                        f"one each (default: {DEFAULT_HEAD_MODE}). `separate` "
+                        f"triples the head parameters; the encoder forward "
+                        f"stays shared either way.")
+    p.add_argument("--scorer", default=DEFAULT_SCORER, choices=list(SCORERS),
+                   help=f"Scoring function over (h, r, t) "
+                        f"(default: {DEFAULT_SCORER}). complex/rotate read the "
+                        f"vector as D/2 complex numbers and need an even "
+                        f"scoring width; transe/rotate return a negated "
+                        f"distance, so --margin means something different for "
+                        f"them. See kgfm/scorers.py.")
     # Loader
     p.add_argument("--max-text-len", type=int, default=512)
     p.add_argument("--batch-size", type=int, default=256,
@@ -1126,6 +1187,8 @@ def config_from_args(a: argparse.Namespace) -> TrainConfig:
         freeze_encoder=a.freeze_encoder,
         proj_dim=a.proj_dim,
         head=a.head,
+        head_mode=a.head_mode,
+        scorer=a.scorer,
         max_text_len=a.max_text_len,
         batch_size=a.batch_size,
         per_device_train_batch_size=a.per_device_train_batch_size,

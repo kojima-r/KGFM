@@ -54,3 +54,5 @@ benchmarks/results/
 # Scaling-study run directories and LR-probe output; same reason as above —
 # multi-GB of logs, checkpoints and 5MB HTML reports per run.
 benchmark_scaling/results/
+benchmark_scaling_data/results/
+benchmark_scorer/results/

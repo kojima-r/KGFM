@@ -28,6 +28,28 @@ def _csv(value: str) -> list:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _data_sizes(value: str) -> list:
+    """Parse the unique-data axis: ints, with `all`/`null`/`none` for no cap.
+
+    `None` has to be expressible on the command line because "the whole file"
+    is a real point on the axis — the right-hand end of it — and there is no
+    integer that means it.
+    """
+    out = []
+    for item in _csv(value):
+        if item.lower() in ("all", "null", "none"):
+            out.append(None)
+            continue
+        try:
+            out.append(int(item))
+        except ValueError:
+            raise SystemExit(
+                f"--data-sizes takes integers or all/null/none "
+                f"(got {item!r})"
+            ) from None
+    return out
+
+
 def _add_shared(p: argparse.ArgumentParser, *, with_out_dir: bool = True) -> None:
     """Flags every bench subcommand understands."""
     if with_out_dir:
@@ -82,6 +104,23 @@ def _add_sweep(p: argparse.ArgumentParser) -> None:
     p.add_argument("--freezes", type=_csv, default=None,
                    help="Comma-separated: off,on. 'on' needs a head with "
                         "parameters (proj-dim, or head=linear/mlp).")
+    p.add_argument("--head-modes", type=_csv, default=None,
+                   help="Comma-separated head wiring modes to sweep "
+                        "(shared,separate). `separate` gives h, r and t their "
+                        "own projection head. More than one adds a "
+                        "_<head_mode> segment to every cell tag.")
+    p.add_argument("--scorers", type=_csv, default=None,
+                   help="Comma-separated scoring functions to sweep "
+                        "(distmult,complex,transe,rotate). More than one adds "
+                        "a _<scorer> segment to every cell tag. complex and "
+                        "rotate need an even --proj-dim.")
+    p.add_argument("--data-sizes", type=_data_sizes, default=None,
+                   help="Comma-separated max_rows_per_file values to sweep as "
+                        "the *unique data* axis, e.g. 10000,100000,1000000 "
+                        "('all' or 'null' = no cap). More than one adds a "
+                        "_d<size> segment to every cell tag. This is a sweep "
+                        "axis, not a global override: use "
+                        "--max-rows-per-file to set one value for every cell.")
     p.add_argument("--protocols", type=_csv, default=None,
                    help="Comma-separated: pooled,filtered")
     # Everything from here down is a cell-level setting, and passing it on the

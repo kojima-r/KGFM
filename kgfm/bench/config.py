@@ -40,12 +40,51 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 from ..encoders import ENCODER_PRESETS, is_frozen_only, is_transformer
-from ..heads import DEFAULT_HEAD, HEADS, is_trainable
+from ..heads import (DEFAULT_HEAD, DEFAULT_HEAD_MODE, HEAD_MODES, HEADS,
+                     is_trainable)
+from ..scorers import DEFAULT_SCORER, SCORERS
 
 STEPS = ("prep", "sweep", "viz")
+
+
+class CellSpec(NamedTuple):
+    """What identifies one cell of the sweep.
+
+    A NamedTuple rather than a bare tuple because this grew from
+    (encoder, freeze, tag) to seven fields, and every consumer that unpacked
+    it positionally had to be edited in lockstep each time an axis was added —
+    `data_size_of` reading `spec[3]` was one wrong index away from silently
+    assigning the wrong cap to every cell.
+    """
+
+    encoder: str
+    head: str
+    head_mode: str
+    scorer: str
+    freeze: str
+    data_size: Optional[int]
+    tag: str
+
+
+def data_tag(rows: Optional[int]) -> str:
+    """Short, sortable name for a `max_rows_per_file` value.
+
+    Goes into the cell tag, so it has to be filename-safe and stable — the
+    result JSON and the checkpoint directory are both named after it. `all`
+    rather than `None` for the uncapped cell, and SI-ish suffixes so the tags
+    read as a size ladder (`d10k`, `d100k`, `d1m`) instead of a column of
+    zeroes.
+    """
+    if rows is None:
+        return "all"
+    rows = int(rows)
+    for div, suffix in ((1_000_000_000, "b"), (1_000_000, "m"), (1_000, "k")):
+        if rows >= div and rows % div == 0:
+            return f"{rows // div}{suffix}"
+    return str(rows)
 
 # Settings that describe one training pass and may therefore differ per cell.
 # Everything not listed here is run-level and may only appear at the top of a
@@ -118,6 +157,20 @@ class BenchConfig:
     # distinguishable in the run directory and the report.
     heads: List[str] = field(default_factory=lambda: [DEFAULT_HEAD])
     freezes: List[str] = field(default_factory=lambda: ["off"])
+    # Unique-data sizes to sweep, as `max_rows_per_file` values (null = the
+    # whole file). Empty means "not an axis" and tags are unchanged; with more
+    # than one entry each tag gains a `_d<size>` segment, exactly as `heads`
+    # does. This is the axis of the dataset-size scaling study: the model is
+    # held fixed and what varies is how much unique data it can reach, so it
+    # has to be a sweep axis rather than a per-cell override — otherwise every
+    # cell would be the same encoder and collide on one tag.
+    data_sizes: List[Optional[int]] = field(default_factory=list)
+    # Whether h/r/t share one head, and what combines the three vectors. Both
+    # are sweep axes for the same reason `heads` is: a cell that differs only
+    # in one of them is a different model and needs its own tag. Empty falls
+    # back to the single default, and a single-valued axis adds no tag segment.
+    head_modes: List[str] = field(default_factory=lambda: [DEFAULT_HEAD_MODE])
+    scorers: List[str] = field(default_factory=lambda: [DEFAULT_SCORER])
     protocols: List[str] = field(default_factory=lambda: ["pooled", "filtered"])
     # --- cell-level defaults (see CELL_FIELDS). `defaults:` in a config file
     # sets these; `cells: <tag>:` overrides them for one cell. A transformer
@@ -195,36 +248,83 @@ class BenchConfig:
     skip: List[str] = field(default_factory=list)
     resume: Optional[str] = None         # None = fresh run; else a run target
 
-    def cell_specs(self) -> List[tuple]:
-        """(encoder, head, freeze, tag) for every cell, in sweep order.
+    def cell_specs(self) -> List["CellSpec"]:
+        """One `CellSpec` per cell, in sweep order.
 
         `freeze=on` is only a cell for pretrained encoders — there is no LM to
         freeze in the ngram one, so it would duplicate its `off` cell.
+
+        `data_size` is a `max_rows_per_file` value, or None when `data_sizes`
+        is not being swept. It is an axis in its own right because the
+        dataset-size scaling study (`benchmark_scaling_data/`) holds the model
+        fixed and varies how much *unique* data it can reach — without it,
+        every cell in that sweep would be the same encoder and would collide
+        on one tag.
         """
-        specs: List[tuple] = []
+        specs: List[CellSpec] = []
         multi_head = len(self.heads) > 1
+        modes = list(self.head_modes) or [DEFAULT_HEAD_MODE]
+        scorers = list(self.scorers) or [DEFAULT_SCORER]
+        multi_mode, multi_scorer = len(modes) > 1, len(scorers) > 1
+        # None is a real point on this axis ("no cap"), so it survives the
+        # int() the other entries get.
+        sizes: List[Optional[int]] = (
+            [None if d is None else int(d) for d in self.data_sizes]
+            if self.data_sizes else [None]
+        )
+        multi_data = len(sizes) > 1
         for encoder in self.encoders:
             for head in self.heads:
-                for freeze in self.freezes:
-                    if freeze == "on" and not is_transformer(encoder):
-                        continue
-                    # 7B-class presets cannot be fine-tuned here at all (3B
-                    # sequences per step), so their freeze=off cell is not a
-                    # cell — the same kind of rule as ngram x freeze=on.
-                    if freeze == "off" and is_frozen_only(encoder):
-                        continue
-                    # The head segment only appears when it distinguishes
-                    # something, so single-head configs keep the tags (and
-                    # therefore the result filenames) they have always had.
-                    tag = encoder + (f"_{head}" if multi_head else "")
-                    if freeze == "on":
-                        tag += "_frozen"
-                    specs.append((encoder, head, freeze, tag))
+                for mode in modes:
+                    for scorer in scorers:
+                        for freeze in self.freezes:
+                            if freeze == "on" and not is_transformer(encoder):
+                                continue
+                            # 7B-class presets cannot be fine-tuned here at
+                            # all (3B sequences per step), so their freeze=off
+                            # cell is not a cell — the same kind of rule as
+                            # ngram x freeze=on.
+                            if freeze == "off" and is_frozen_only(encoder):
+                                continue
+                            for data_size in sizes:
+                                # Each segment only appears when it
+                                # distinguishes something, so a config that
+                                # sweeps none of these extra axes keeps the
+                                # tags — and therefore the result filenames —
+                                # it has always had.
+                                tag = encoder
+                                if multi_head:
+                                    tag += f"_{head}"
+                                if multi_mode:
+                                    tag += f"_{mode}"
+                                if multi_scorer:
+                                    tag += f"_{scorer}"
+                                if multi_data:
+                                    tag += f"_d{data_tag(data_size)}"
+                                if freeze == "on":
+                                    tag += "_frozen"
+                                specs.append(CellSpec(
+                                    encoder=encoder, head=head,
+                                    head_mode=mode, scorer=scorer,
+                                    freeze=freeze, data_size=data_size,
+                                    tag=tag))
         return specs
 
     def cell_tags(self) -> List[str]:
         """Just the tags — the identity of each cell in the run directory."""
-        return [spec[3] for spec in self.cell_specs()]
+        return [spec.tag for spec in self.cell_specs()]
+
+    def data_size_of(self, tag: str) -> Optional[int]:
+        """The swept `max_rows_per_file` for one cell, or None if not swept.
+
+        `resolve_cell` needs this because the size is decided by the *axis*,
+        not by `defaults:` or `cells:` — it is the one cell-level value that
+        comes from the tag rather than from the file.
+        """
+        for spec in self.cell_specs():
+            if spec.tag == tag:
+                return spec.data_size
+        return None
 
     def _epoch_steps(self, epochs: float, batch_size: int,
                      max_rows_per_file: Optional[int],
@@ -261,6 +361,12 @@ class BenchConfig:
         anything meant to differ per cell belongs in the file.
         """
         resolved = {name: getattr(self, name) for name in CELL_FIELDS}
+        # The swept data size sits between the defaults and `cells:` — it is
+        # what makes this cell the cell it is, so `defaults:` must not win over
+        # it, but an explicit `cells: <tag>: max_rows_per_file:` still can (and
+        # a CLI flag still overrides everything, as with any cell field).
+        if self.data_sizes:
+            resolved["max_rows_per_file"] = self.data_size_of(tag)
         resolved.update(self.cells.get(tag, {}))
         resolved.update({k: v for k, v in self.cli_overrides.items()
                          if k in CELL_FIELDS})
@@ -315,17 +421,26 @@ class BenchConfig:
             raise SystemExit(
                 f"Unknown cell tag(s) in `cells:`: {', '.join(sorted(unknown))}\n"
                 f"This run's cells are: {', '.join(known) or '(none)'}\n"
-                "A tag is <encoder>[_<head>][_frozen] — the _<head> segment "
-                "appears only when more than one head is swept — and must be "
-                "a cell that `encoders` x `heads` x `freezes` produces."
+                "A tag is <encoder>[_<head>][_<head_mode>][_<scorer>][_d<size>]"
+                "[_frozen] — each optional segment appears only when that axis "
+                "has more than one value — and must be a cell that "
+                "`encoders` x `heads` x `head_modes` x `scorers` x `freezes` x "
+                "`data_sizes` produces."
             )
-        bad_heads = [h for h in self.heads if h not in HEADS]
-        if bad_heads:
-            raise SystemExit(
-                f"Invalid heads value(s): {', '.join(bad_heads)} "
-                f"(use {'|'.join(HEADS)})"
-            )
-        for encoder, head, freeze, tag in self.cell_specs():
+        for name, values, allowed in (
+            ("heads", self.heads, HEADS),
+            ("head_modes", self.head_modes, HEAD_MODES),
+            ("scorers", self.scorers, SCORERS),
+        ):
+            bad = [v for v in values if v not in allowed]
+            if bad:
+                raise SystemExit(
+                    f"Invalid {name} value(s): {', '.join(bad)} "
+                    f"(use {'|'.join(allowed)})"
+                )
+        for spec in self.cell_specs():
+            encoder, head, freeze, tag = (
+                spec.encoder, spec.head, spec.freeze, spec.tag)
             if freeze != "on":
                 continue
             cell = self.resolve_cell(tag)
@@ -372,6 +487,34 @@ _BOOL_WORDS = {True: "on", False: "off"}
 def _coerce(field: str, value: Any) -> Any:
     if field == "freezes" and isinstance(value, list):
         return [_BOOL_WORDS.get(v, v) if isinstance(v, bool) else v for v in value]
+    if field == "data_sizes" and isinstance(value, list):
+        # `null` is meaningful here — it is the uncapped cell — so it is kept
+        # rather than filtered out, and everything else has to be a positive
+        # int because it becomes `max_rows_per_file`.
+        out: List[Optional[int]] = []
+        for v in value:
+            if v is None:
+                out.append(None)
+                continue
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                raise SystemExit(
+                    f"data_sizes entries must be integers or null "
+                    f"(got {v!r})"
+                ) from None
+            if n <= 0:
+                raise SystemExit(
+                    f"data_sizes entries must be positive (got {n}); use "
+                    f"null for 'no cap'."
+                )
+            out.append(n)
+        if len(set(out)) != len(out):
+            raise SystemExit(
+                f"data_sizes has duplicates ({value!r}); each size is one "
+                f"cell, so two identical entries would collide on one tag."
+            )
+        return out
     return value
 
 

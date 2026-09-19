@@ -85,6 +85,22 @@ kgfm train --data-root data --valid-buckets 1 --test-buckets 1 --n-buckets 10
 
 混在も可能です。`--train-list` だけ与えれば、リストに含まれないファイルが valid / test に自動分割されます。
 
+**リストの作り方** — 同梱の `list_chembl/` などは
+`preprocess_list/make_lists.py` で生成しています。`data/` は生きたミラーで、
+ファイルが増減すると自動分割の境界が黙って動いてしまうため、ベンチマークの
+config はすべて凍結したリストを指しています。
+
+```bash
+python preprocess_list/make_lists.py --source chembl --out-dir list_chembl
+python preprocess_list/make_lists.py --source uniprot --out-dir list_uniprot  # 別ソース
+python preprocess_list/make_lists.py --source chembl --check list_chembl      # 検証のみ
+bash preprocess_list/make_all.sh                                             # 同梱リストを一括検証
+```
+
+既定の分割は `kgfm.data.split_files_three_way`（上記の自動分割と同一の関数）
+なので、リストを作っても trainer 自身の分割と一致します。詳細は
+`preprocess_list/README.md` を参照してください。
+
 ---
 
 ## クイックスタート
@@ -164,7 +180,8 @@ print((h * r * t).sum(-1))   # 行ごとのスコア
 │   ├── __init__.py      # 公開 API の re-export
 │   ├── data.py          # ストリーミング TSV パイプライン
 │   ├── encoders.py      # HashedNgram / Transformer エンコーダ + ENCODER_PRESETS
-│   ├── heads.py         # 射影ヘッドのレジストリ (auto / identity / linear / mlp / residual_mlp)
+│   ├── heads.py         # 射影ヘッドのレジストリ + 結線モード (shared / separate)
+│   ├── scorers.py       # スコア関数 (distmult / complex / transe / rotate)
 │   ├── model.py         # DistMultScorer
 │   ├── losses.py        # 学習目的関数 (contrastive / softmax_ce / bce / ...)
 │   ├── eval.py          # MRR / Hit@k / nDCG (kgfm eval)
@@ -182,10 +199,13 @@ print((h * r * t).sum(-1))   # 行ごとのスコア
 │   ├── scaling/         # スケーリング則の集計 (kgfm scaling)
 │   └── baselines/       # ULTRA / MOTIF (kgfm-ultra / kgfm-motif)
 ├── benchmarks/          # 手法比較のシェルラッパ + config_*.yaml (詳細は benchmarks/README.md)
-├── benchmark_scaling/   # スケーリング則の実験 (詳細は benchmark_scaling/README.md)
+├── benchmark_scaling/   # モデルサイズのスケーリング則 (詳細は benchmark_scaling/README.md)
+├── benchmark_scaling_data/  # データ量のスケーリング則 (詳細は benchmark_scaling_data/README.md)
+├── benchmark_scorer/    # scorer × ヘッド結線の比較 (詳細は benchmark_scorer/README.md)
 ├── list_small/          # スモークラン用の小さなファイルリスト
 ├── list_large/          # フルスケールのファイルリスト
 ├── list_chembl/         # ChEMBL 専用ベンチマークリスト
+├── preprocess_list/     # list_*/ を生成するスクリプト (詳細は preprocess_list/README.md)
 ├── checkpoints/         # 保存先 (gitignore)
 ├── data -> ...          # 実コーパスへのシンボリックリンク
 ├── pyproject.toml
@@ -254,6 +274,48 @@ print((h * r * t).sum(-1))   # 行ごとのスコア
   fast/slow どちらでも構築できず、`Alibaba-NLP/gte-Qwen2-7B-instruct` は
   同梱の `modeling_qwen.py` が `DynamicCache` から削除された
   `get_usable_length()` を呼びます。どちらもバージョン非互換です。
+
+### ヘッド結線 (`--head-mode`)
+
+| モード | 中身 |
+|---|---|
+| `shared`（既定） | h, r, t を**同じヘッド**に通す。従来の唯一の挙動 |
+| `separate` | h, r, t に**専用ヘッド**。ヘッドのパラメータは 3 倍 |
+
+エンコーダの forward は両モードとも 1 回のままです（`encode_triple` の
+3B バッチはそのまま、ヘッドだけスライスごとに適用）。`separate` の追加コストは
+パラメータ 3 倍と小さな行列積 3 つで、エンコーダ 3 パスではありません。
+
+`separate` にすると「同じ文字列でも h として射影したものと t として射影した
+ものは別ベクトル」になるため、`encode()` は **role 引数**を取ります
+（既定 `role="t"` — 一括エンコードの呼び出し元はどれも候補 tail のバンクを
+作っているため）。比較するときは **`separate` がヘッド容量 3 倍**である点を
+必ず添えてください。詳細は `benchmark_scorer/README.md`。
+
+### スコア関数 (`--scorer`)
+
+| scorer | 式 | 種別 | 対称性 |
+|---|---|---|---|
+| `distmult`（既定） | `Σ_d h_d·r_d·t_d` | 内積 | **対称** |
+| `complex` | `Re<h, r, conj(t)>` | 内積 | 非対称 |
+| `transe` | `-‖h + r - t‖₂` | 距離 | 非対称 |
+| `rotate` | `-‖h ∘ r̂ - t‖`（r の各複素成分を単位長に正規化） | 距離 | 非対称 |
+
+**DistMult が対称なのは実際の制約**で、「A が B を阻害する」と
+「B が A を阻害する」を区別できません。ComplEx はベクトルの前半・後半を
+複素数の実部・虚部として読むことでこれを外します。
+
+**インタフェースは数式ではなく評価コストが決めています。** 候補プールは最大
+200 万件なので、全 scorer は `query(h,r)` → `score_against(q, T)` の 2 段形で
+書ける必要があります（これが `hr @ pool.t()` を成立させている条件）。この形に
+書けない scorer は入れません — 200 万 tail の評価を黙って OOM に変えるため
+です。`complex` と `rotate` は D/2 個の複素数として読むので**偶数次元が必須**
+で、奇数だと構築時にエラーになります。
+
+なお既定の `contrastive` 損失は距離系にとって中立ではありません（L2 正規化が
+内積系では順位不変だが距離系では幾何を変える）。`transe` / `rotate` は本来
+margin 系の損失で学習するもので、この点は `benchmark_scorer/README.md` に
+詳述しています。
 
 ### ヘッド (`--head`)
 
@@ -825,6 +887,40 @@ bash benchmark_scaling/run_scaling_scratch.sh   # 本番（ランダム初期化
 読み替えるだけなので、終わった run に後から適用できます。設計・実測値・
 落とし穴（学習率をサイズごとに振らないと指数が平坦化する、early stopping を
 入れてはいけない、など）は `benchmark_scaling/README.md` にまとめてあります。
+
+---
+
+## データ量に対するスケーリング則 (`benchmark_scaling_data/`)
+
+同じ枠組みで**軸だけを差し替えた**実験です。モデルを固定して、
+**ユニークな学習データ量 D** を振ります。
+
+```bash
+bash benchmark_scaling_data/run_data_smoke.sh    # 数分の通し確認
+bash benchmark_scaling_data/run_data_ngram.sh    # ngram 8 セル（約 2 時間）
+bash benchmark_scaling_data/run_data_scratch.sh  # 41M transformer 8 セル（約 11 時間）
+```
+
+軸は `data_sizes:`（= `max_rows_per_file`）で、`heads` と同じ形の sweep 軸
+です。**上限をかけないとデータ量の効果は原理的に測れません** — train プールは
+6.74 億行あり本番の予算は 614 万例（0.009 エポック）なので、同じ行が二度
+出てこず「データを増やす」と「step を増やす」が同じ変数になってしまいます。
+上限をかけるとプールが有限になり、学習ループがデータを再訪するので、
+過学習という有限データ効果が現れます。
+
+`python benchmark_scaling_data/report_data.py --out-dir latest` が `L(D)` を
+フィットします。**モデルサイズ軸と違い 1 セル 1 点**（D はセルの属性なので、
+そのセルの best validation loss）で、軌跡は「小さい D のセルが途中で折れ返る」
+ことを示すのに使います。
+
+**両方の本番スイープは実行済み**です。ユニークデータを 8,500 → 774 万行と
+振ると、best validation loss は ngram で 4.6147 → 3.6738、`scratch-medium`
+(41M) で 3.4253 → 2.9357 まで下がります。指数は **−0.0339 (R²=0.980)** と
+**−0.0280 (R²=0.960)**。過学習の機序も直接見えていて、D が小さいほど最適点が
+早く来て（step 250 → 15,500）その後の悪化が大きくなります（+1.23 → +0.08 nats）。
+実測表・落とし穴（1 パスに届かないセルを混ぜると指数が半分になる、
+`max_rows_per_file` は先頭 D 行でランダム標本ではない、など）は
+`benchmark_scaling_data/README.md` にあります。
 
 ---
 

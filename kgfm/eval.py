@@ -46,7 +46,9 @@ def _encode_tail_pool(
     out = []
     for i in range(0, len(texts), batch_size):
         chunk = texts[i : i + batch_size]
-        emb = scorer.encode(chunk)
+        # Role matters under head_mode=separate: this bank is scored
+        # against queries, so it must be projected by the tail head.
+        emb = scorer.encode(chunk, role="t")
         emb = scorer._maybe_norm(emb, scorer.normalize)
         out.append(emb.to(device))
     if not out:
@@ -152,7 +154,8 @@ def _ranks_with_ties(
 
     Exact equality is not enough to catch it. A collapsed model's scores differ
     by ~1e-7 because the true tail is scored with ``(hr*t).sum(-1)`` while the
-    candidates come from ``hr @ pool.t()``: different float accumulation order,
+    candidates come from the fused ``score_against`` matmul: different float
+    accumulation order,
     and the difference is *systematic*, so the true tail wins every tie-break
     and MRR lands around 0.93 instead. Comparing within a tolerance closes that.
 
@@ -262,9 +265,13 @@ def _evaluate_pooled(
         h, r, t = scorer.encode_triple(h_text, r_text, t_text)
         h, r, t = h.to(device), r.to(device), t.to(device)
 
-        hr = h * r  # [B, D]
-        scores_pool = hr @ pool_emb.t()  # [B, P]
-        true_score = (hr * t).sum(dim=-1, keepdim=True)  # [B, 1]
+        # Through the scorer, not hard-coded: `query` is the half that does not
+        # involve t, and `score_against` is the fused [B, P] op (a matmul for
+        # DistMult/ComplEx, a cdist for TransE/RotatE). See kgfm/scorers.py.
+        hr = scorer.query(h, r)  # [B, Dq]
+        scores_pool = scorer.score_against(hr, pool_emb)  # [B, P]
+        true_score = scorer.scorer.score_diag(
+            hr, scorer.scorer.tail(t)).unsqueeze(1)  # [B, 1]
         B = len(t_text)
         # Don't double-count the true tail when it happens to be in pool.
         for i in range(B):
@@ -337,9 +344,10 @@ def _evaluate_filtered(
         h, r = h.to(device), r.to(device)
         t = t.to(device)
 
-        hr = h * r  # [B, D]
-        scores = hr @ tail_emb.t()  # [B, V]
-        true_score = (hr * t).sum(dim=-1, keepdim=True)  # [B, 1]
+        hr = scorer.query(h, r)  # [B, Dq]
+        scores = scorer.score_against(hr, tail_emb)  # [B, V]
+        true_score = scorer.scorer.score_diag(
+            hr, scorer.scorer.tail(t)).unsqueeze(1)  # [B, 1]
         B = len(t_text)
 
         # For each row, mask out other known true tails for (h,r), then
@@ -449,7 +457,8 @@ def _load_scorer_from_checkpoint(
 ) -> DistMultScorer:
     """Reconstruct a DistMultScorer from a checkpoint saved by ``kgfm.train``."""
     from .encoders import make_encoder
-    from .heads import DEFAULT_HEAD
+    from .heads import DEFAULT_HEAD, DEFAULT_HEAD_MODE
+    from .scorers import DEFAULT_SCORER
 
     ckpt = torch.load(ckpt_path, map_location=device)
     cfg = ckpt.get("config", {}) or {}
@@ -470,6 +479,11 @@ def _load_scorer_from_checkpoint(
         encoder, proj_dim=cfg.get("proj_dim"), normalize=True,
         head_dropout=cfg.get("head_dropout", 0.0),
         head=cfg.get("head", DEFAULT_HEAD),
+        # `.get` with the default is what keeps pre-existing checkpoints
+        # loadable: they have no such key and must reconstruct as shared /
+        # distmult, which is what they were trained as.
+        head_mode=cfg.get("head_mode", DEFAULT_HEAD_MODE),
+        scorer=cfg.get("scorer", DEFAULT_SCORER),
     ).to(device)
     scorer.load_state_dict(ckpt["model_state"])
     scorer.eval()

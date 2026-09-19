@@ -1,0 +1,80 @@
+# Scorer x head-mode comparison — the production sweep.
+#
+# THE QUESTION
+# `benchmarks/config_xlarge_compare.yaml` asks which *encoder* and *head type*
+# to use. This asks the two questions that sit downstream of both: once the
+# encoder has produced three vectors,
+#   1. should h, r and t have been projected by the same head, and
+#   2. what should combine them into a score?
+# Neither had ever been a choice here — the answer was hard-coded to
+# (shared, DistMult) for this repo's whole history.
+#
+# 2 head modes x 4 scorers = 8 cells.
+#
+# WHAT IS HELD CONSTANT, AND WHY
+#   encoder: ngram. Not because it is the best (it placed 5th of 28 in the
+#   architecture sweep) but because it trains at ~17,000 ex/s, and this
+#   comparison needs the *scorer* to be the only thing that varies. A fine-tuned
+#   transformer would put ~1000x more parameters between the axis and the
+#   metric, and 8 cells of it would cost days rather than hours.
+#
+#   proj_dim: 256. Even, which complex and rotate require (they read the vector
+#   as 128 complex numbers). The model refuses an odd width rather than
+#   silently truncating.
+#
+#   batch_size: 512 for every cell. B-1 IS the in-batch negative count, so a
+#   comparison at different batch sizes would confound the scorer with how many
+#   negatives it saw.
+#
+#   loss: contrastive (the default) for every cell. See the caveat below — this
+#   is the one choice that is not neutral between the scorers, and the report
+#   says so rather than quietly switching it per cell.
+#
+# THE CAVEAT THAT MATTERS MOST
+# `contrastive` L2-normalizes the query and the tails. For an inner-product
+# scorer (distmult, complex) that is a per-row positive rescaling and cannot
+# change the ranking; for a distance scorer (transe, rotate) it moves the
+# points and changes the geometry. TransE and RotatE are conventionally trained
+# with a margin loss on raw scores. Keeping one loss across all eight cells is
+# what makes the *scorer* the only variable, but it handicaps the two distance
+# scorers — so their numbers are "under this loss", not "the best they can do".
+# Running the same config with `--loss self_adversarial --margin 9` is the
+# natural follow-up; it changes what is held fixed, so it is a second run
+# rather than a per-cell tweak.
+#
+#   bash benchmark_scorer/run_scorer.sh
+
+run_label: scorer
+results_root: benchmark_scorer/results/chembl
+
+# --- run-level ---
+prep_max_train: 400000
+prep_max_valid: 12000
+prep_max_test: 12000
+
+encoders: [ngram]
+heads: [linear]
+freezes: ["off"]
+head_modes: [shared, separate]
+scorers: [distmult, complex, transe, rotate]
+protocols: [pooled, filtered]
+
+# --- every cell ---
+defaults:
+  max_steps: 20000        # x 512 = 10,240,000 examples per cell
+  batch_size: 512
+  proj_dim: 256
+
+  eval_every: 250
+  valid_loss_batches: 8
+  log_every: 100
+
+  # ngram's EmbeddingBag *is* its encoder and it trains from scratch, so
+  # decaying it would change the model rather than regularise a pretrained one.
+  encoder_weight_decay: 0.0
+  head_weight_decay: 0.0
+
+  n_eval_triples: 12000
+  pool_size: 12000
+  max_filter_tails: 460000
+  max_filter_rows: 10000000

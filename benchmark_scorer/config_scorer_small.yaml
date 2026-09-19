@@ -1,0 +1,33 @@
+# Scorer x head-mode comparison, smoke scale — proves the 8 cells run in minutes.
+#
+# The sweep is `head_modes` x `scorers`, both added to BenchConfig the way
+# `heads` and `data_sizes` were. Everything else is pinned, because this
+# comparison only means something if the two axes are the only thing moving.
+
+run_label: scorer_small
+results_root: benchmark_scorer/results/chembl
+
+prep_max_train: 50000
+prep_max_valid: 2000
+prep_max_test: 2000
+
+encoders: [ngram]
+heads: [linear]
+freezes: ["off"]
+head_modes: [shared, separate]
+scorers: [distmult, complex, transe, rotate]
+protocols: [pooled]
+
+defaults:
+  max_steps: 200
+  batch_size: 64
+  # Even, because complex and rotate read the vector as proj_dim/2 complex
+  # numbers; the model refuses an odd width rather than silently truncating.
+  proj_dim: 64
+  eval_every: 20
+  valid_loss_batches: 4
+  log_every: 10
+  n_eval_triples: 500
+  pool_size: 500
+  max_filter_tails: 5000
+  max_filter_rows: 100000

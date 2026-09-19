@@ -2,9 +2,12 @@
 
 The head is the only trainable part of a frozen-encoder run and a small
 fraction of a fine-tuned one, so it is worth being able to swap. All heads map
-``[B, in_dim] -> [B, out_dim]`` and are applied identically to h, r and t —
-``DistMultScorer.encode`` runs one head over the concatenated bundle, so a head
-cannot treat the three roles differently by construction.
+``[B, in_dim] -> [B, out_dim]``.
+
+Two ways to wire them to the triple, chosen with ``head_mode``: ``shared``
+(one head for h, r and t, which is what ``encode`` did for this repo's whole
+history) or ``separate`` (one head per role). See ``HEAD_MODES`` below for why
+neither is obviously right.
 
 Choosing between them
 ---------------------
@@ -26,6 +29,28 @@ import torch
 import torch.nn as nn
 
 HEADS = ("auto", "identity", "linear", "mlp", "residual_mlp")
+
+# Whether h, r and t go through the same head or one each.
+#
+# `shared` is what this repo did for its entire history, and it is not an
+# arbitrary default: the encoder forward is already shared (encode_triple
+# bundles h+r+t into one 3B-length batch for a 3x speedup), so sharing the head
+# too keeps the three roles in one representation space. That is what makes
+# `hr @ pool.t()` meaningful — the pool is encoded once, as tails, and the
+# query lives in the same space.
+#
+# `separate` gives each role its own parameters. The argument for it is that
+# the three roles are genuinely different: h and t are entities, r is a
+# relation, and DistMult's h/t symmetry means a shared head cannot even learn
+# to treat head-position and tail-position differently. The argument against is
+# 3x the head parameters and, for a frozen encoder, 3x the only thing that
+# trains — so a difference between the modes is not purely architectural
+# unless the comparison holds the parameter budget in mind. The benchmark in
+# benchmark_scorer/ reports head parameter counts next to the metrics for
+# exactly that reason.
+HEAD_MODES = ("shared", "separate")
+DEFAULT_HEAD_MODE = "shared"
+ROLES = ("h", "r", "t")
 # "auto" is what DistMultScorer always did: a Linear when proj_dim actually
 # changes the width, nn.Identity when it does not. It stays the default so
 # every result produced before this module is reproducible unchanged — note

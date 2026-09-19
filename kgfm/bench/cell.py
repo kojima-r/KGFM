@@ -26,7 +26,8 @@ from ..data import read_file_list
 from ..encoders import make_encoder
 from ..eval import evaluate
 from ..encoders import ENCODER_PRESETS
-from ..heads import DEFAULT_HEAD, HEADS
+from ..heads import DEFAULT_HEAD, DEFAULT_HEAD_MODE, HEAD_MODES, HEADS
+from ..scorers import DEFAULT_SCORER, SCORERS
 from ..model import DistMultScorer
 from ..losses import DEFAULT_LOSS, DEFAULT_TEMPERATURE, LOSSES
 from ..train import TrainConfig, train as kgfm_train
@@ -54,6 +55,8 @@ def _build_config(args: argparse.Namespace) -> TrainConfig:
         embedding_dim=args.embedding_dim,
         proj_dim=args.proj_dim,
         head=args.head,
+        head_mode=args.head_mode,
+        scorer=args.scorer,
         transformer_model=args.transformer_model,
         freeze_encoder=args.freeze_encoder,
         batch_size=args.batch_size,
@@ -122,6 +125,11 @@ def _final_eval(ckpt_path: str, args: argparse.Namespace) -> dict:
         encoder, proj_dim=cfg.get("proj_dim", args.proj_dim), normalize=True,
         head_dropout=cfg.get("head_dropout", 0.0),
         head=cfg.get("head", DEFAULT_HEAD),
+        # `.get` with the default is what keeps pre-existing checkpoints
+        # loadable: they have no such key and must reconstruct as shared /
+        # distmult, which is what they were trained as.
+        head_mode=cfg.get("head_mode", DEFAULT_HEAD_MODE),
+        scorer=cfg.get("scorer", DEFAULT_SCORER),
     ).to(device)
     scorer.load_state_dict(ckpt["model_state"])
 
@@ -180,6 +188,10 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--embedding-dim", type=int, default=256)
     p.add_argument("--proj-dim", type=int, default=None)
     p.add_argument("--head", default=DEFAULT_HEAD, choices=list(HEADS))
+    p.add_argument("--head-mode", default=DEFAULT_HEAD_MODE,
+                   choices=list(HEAD_MODES))
+    p.add_argument("--scorer", default=DEFAULT_SCORER,
+                   choices=list(SCORERS))
     p.add_argument("--batch-size", type=int, default=256,
                    help="Per-device micro-batch size.")
     p.add_argument("--per-device-train-batch-size", type=int, default=None,
@@ -266,6 +278,8 @@ def run_from_args(args: argparse.Namespace) -> Optional[dict]:
         "method": "kgfm",
         "encoder": args.encoder,
         "head": args.head,
+        "head_mode": args.head_mode,
+        "scorer": args.scorer,
         "freeze_encoder": bool(args.freeze_encoder),
         "proj_dim": args.proj_dim,
         "batch_size": args.batch_size,
