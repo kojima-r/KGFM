@@ -117,6 +117,15 @@ def collect(out_dir: Path) -> List[Cell]:
         # kgfm_<protocol>_<tag>.json
         tag = path.stem.split("_", 2)[2]
         if tag in cells:
+            # A cell trains once and each further protocol re-scores the same
+            # checkpoint with --skip-train, so only the training-owning pass
+            # records `train_seconds`. Globbing sorts `filtered` before
+            # `pooled`, so the first JSON per tag is usually the re-score and
+            # its None would leave the column empty while the number exists in
+            # the sibling file. Keep the first pass's metrics (the protocol
+            # choice is deliberate) and backfill only what it cannot know.
+            if cells[tag].train_seconds is None:
+                cells[tag].train_seconds = rec.get("train_seconds")
             continue
         curve = curves.get(tag)
         cell = Cell(

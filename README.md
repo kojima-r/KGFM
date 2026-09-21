@@ -922,6 +922,34 @@ bash benchmark_scaling_data/run_data_scratch.sh  # 41M transformer 8 セル（�
 `max_rows_per_file` は先頭 D 行でランダム標本ではない、など）は
 `benchmark_scaling_data/README.md` にあります。
 
+## スコア関数とヘッド結線の比較 (`benchmark_scorer/`)
+
+4 つ目のスタディで、軸は**エンコーダより下**です。3 本のベクトルが出たあと、
+h/r/t はヘッドを共有すべきか（`head_mode`）、何でスコアにまとめるか
+（`scorer`）。2 モード × 4 scorer = 8 セル。
+
+```bash
+bash benchmark_scorer/run_scorer_smoke.sh   # 8 セル、数分
+bash benchmark_scorer/run_scorer.sh         # 本番 8 セル、約 3 時間
+```
+
+**本番は実行済み**です（`ngram`、20,000 step、B=512）。filtered MRR の最良は
+`shared`+`distmult` の **0.4737**、best valid loss の最良は
+`separate`+`complex` の **3.6253** で、**2 つの指標が別のセルを選びます**。
+
+いちばん重要なのは**周辺平均を引用してはいけない**ことです。`separate` は
+MRR 周辺平均で +0.0155 勝っているように見えますが、これは符号の違う 2 つを
+平均した値で、**内積系は `shared`、距離系は `separate` を好みます**
+（distmult −0.0171 / complex −0.0071 に対し transe +0.0492 / rotate +0.0370）。
+pooled・filtered の両プロトコルで 4 セルとも同じ向きなので交互作用であり、
+`report_scorer.py` が平坦な表ではなくグリッドを出すのはこのためです。
+
+`ComplEx` は `DistMult` に勝ちませんでした（0.4671 vs 0.4652、この統計では
+区別不能）。既定の `(shared, DistMult)` は比較を生き延びましたが、それは
+**区別できる対抗馬が無かった**からで、scorer が検証されたからではありません。
+距離系の劣位は `contrastive` が距離系に中立でないという留保つきの値です。
+全表と留保は `benchmark_scorer/README.md`。
+
 ---
 
 ## ライセンス
