@@ -7,8 +7,8 @@
 1. **h, r, t は同じヘッドを通すべきか**（`head_mode`）
 2. **3 本を何で 1 つのスコアにまとめるか**（`scorer`）
 
-どちらもこのリポジトリでは長らく選択肢ですらなく、`(shared, DistMult)` に
-固定されていました。
+どちらも既定が決まっている箇所で、現在の既定は **`separate` + `distmult`**
+です（根拠は下記「この study が既定を決めています」）。
 
 | | benchmarks/ | benchmark_scaling/ | **benchmark_scorer/** |
 |---|---|---|---|
@@ -146,9 +146,25 @@ S = score_against(q, T)      # [B, P]   バンクに対する 1 回の融合演�
 です。ただしそれは**固定するものが変わる**ので、セルごとの調整ではなく
 2 本目の run として扱ってください。
 
+## この study が既定を決めています
+
+**`kgfm` の既定のヘッド結線は `separate`** です
+（`kgfm/heads.py:DEFAULT_HEAD_MODE`）。根拠は下の表の best valid loss で、
+`separate` が 4 つの scorer すべてで 0.16〜0.31 nats 良いためです。
+**filtered MRR では内積系で `shared` が勝っている**ので、これは 2 指標のうち
+loss を採った選択です — `benchmark_scaling/` と `benchmark_scaling_data/` が
+当てはめているのが loss だからです。scorer 側の既定は `distmult` のままです
+（ComplEx と区別できなかったため）。
+
+2 つの実務的な含意があります。**旧チェックポイントは壊れません** —
+`heads.LEGACY_HEAD_MODE` が `head_mode` キーを持たない checkpoint を `shared`
+として復元します。そして **学習率が変わります** — ヘッド 3 倍で最適 LR が
+上がり、サイズ軸 2 コーパスの再プローブで 14 セル中 9 セルが動きました
+（最大 10 倍）。`separate` で既存 config を回すときは LR を測り直してください。
+
 ## 本番の結果
 
-`results/chembl/20260909T035740Z_scorer`（8 セル、`ngram`、20,000 step、
+`results/chembl/scorer`（8 セル、`ngram`、20,000 step、
 B=512、proj_dim 256、`contrastive`、各セル約 17 分）。表の MRR は
 **filtered** プロトコルの値です。
 

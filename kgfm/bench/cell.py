@@ -26,7 +26,8 @@ from ..data import read_file_list
 from ..encoders import make_encoder
 from ..eval import evaluate
 from ..encoders import ENCODER_PRESETS
-from ..heads import DEFAULT_HEAD, DEFAULT_HEAD_MODE, HEAD_MODES, HEADS
+from ..heads import (DEFAULT_HEAD, DEFAULT_HEAD_MODE, HEAD_MODES, HEADS,
+                     LEGACY_HEAD_MODE)
 from ..scorers import DEFAULT_SCORER, SCORERS
 from ..model import DistMultScorer
 from ..losses import DEFAULT_LOSS, DEFAULT_TEMPERATURE, LOSSES
@@ -128,7 +129,9 @@ def _final_eval(ckpt_path: str, args: argparse.Namespace) -> dict:
         # `.get` with the default is what keeps pre-existing checkpoints
         # loadable: they have no such key and must reconstruct as shared /
         # distmult, which is what they were trained as.
-        head_mode=cfg.get("head_mode", DEFAULT_HEAD_MODE),
+        # LEGACY_, not DEFAULT_: a checkpoint with no `head_mode` key
+        # predates the option and was shared. See kgfm/heads.py.
+        head_mode=cfg.get("head_mode", LEGACY_HEAD_MODE),
         scorer=cfg.get("scorer", DEFAULT_SCORER),
     ).to(device)
     scorer.load_state_dict(ckpt["model_state"])

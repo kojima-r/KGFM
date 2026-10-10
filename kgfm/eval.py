@@ -457,7 +457,7 @@ def _load_scorer_from_checkpoint(
 ) -> DistMultScorer:
     """Reconstruct a DistMultScorer from a checkpoint saved by ``kgfm.train``."""
     from .encoders import make_encoder
-    from .heads import DEFAULT_HEAD, DEFAULT_HEAD_MODE
+    from .heads import DEFAULT_HEAD, LEGACY_HEAD_MODE
     from .scorers import DEFAULT_SCORER
 
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -482,7 +482,9 @@ def _load_scorer_from_checkpoint(
         # `.get` with the default is what keeps pre-existing checkpoints
         # loadable: they have no such key and must reconstruct as shared /
         # distmult, which is what they were trained as.
-        head_mode=cfg.get("head_mode", DEFAULT_HEAD_MODE),
+        # LEGACY_, not DEFAULT_: a checkpoint with no `head_mode` key
+        # predates the option and was shared. See kgfm/heads.py.
+        head_mode=cfg.get("head_mode", LEGACY_HEAD_MODE),
         scorer=cfg.get("scorer", DEFAULT_SCORER),
     ).to(device)
     scorer.load_state_dict(ckpt["model_state"])

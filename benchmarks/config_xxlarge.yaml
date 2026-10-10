@@ -93,6 +93,25 @@ freezes: ["off"]
 protocols: [pooled, filtered]
 
 # --- every cell ---
+# LEARNING RATE: HELD AT THE 3e-5 DEFAULT, DELIBERATELY, AND THIS IS MEASURED.
+# Probed for this exact cell (gte-large + mlp, fine-tuned, head_mode=separate,
+# B=256, 2000 steps) on 2026-09-24 -- benchmark_scaling/results/lr_probe_sep_xxlarge_gte:
+#
+#        1e-5     3e-5     1e-4     3e-4
+#      3.2145   2.9793  [2.9421]  collapse
+#
+# 1e-4 is nominally best but beats the default by 0.037 nats, BELOW the ~0.05
+# that a min-over-8-batch statistic resolves, and it sits one grid step from
+# collapse. This run is 1,316,925 steps -- 658x the probe -- and lr_probe.py's
+# own caveat is that a short probe favours large rates because it ends before
+# the large-rate curve flattens. A collapsed cell three days into a seven-day
+# run costs a week; a marginally conservative rate costs a fraction of a nat.
+# So: 3e-5, the rate the completed 20260816T053252Z run used.
+#
+# That choice also buys a clean comparison. Holding the rate fixed makes
+# head_mode the ONLY difference between this run and the archived one, so the
+# shared -> separate delta is unconfounded here -- unlike the data-scaling
+# re-runs, where the rate moved at the same time and the two cannot be split.
 defaults:
   # Exactly one pass over list_chembl/train.txt. Fractional values work too
   # (0.25 for a quarter of the corpus). This replaces max_steps: stating the

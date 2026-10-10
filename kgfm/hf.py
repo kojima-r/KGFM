@@ -412,7 +412,7 @@ def load(repo_or_path: str, device: Optional[str] = None, **kwargs: Any):
     reconstructed from its preset — which pulls the public weights the frozen
     run used — and the head is loaded over it.
     """
-    from .heads import DEFAULT_HEAD, DEFAULT_HEAD_MODE
+    from .heads import DEFAULT_HEAD, LEGACY_HEAD_MODE
     from .scorers import DEFAULT_SCORER
     from .model import DistMultScorer, make_encoder
 
@@ -450,7 +450,9 @@ def load(repo_or_path: str, device: Optional[str] = None, **kwargs: Any):
         # `.get` with the default is what keeps pre-existing checkpoints
         # loadable: they have no such key and must reconstruct as shared /
         # distmult, which is what they were trained as.
-        head_mode=cfg.get("head_mode", DEFAULT_HEAD_MODE),
+        # LEGACY_, not DEFAULT_: a checkpoint with no `head_mode` key
+        # predates the option and was shared. See kgfm/heads.py.
+        head_mode=cfg.get("head_mode", LEGACY_HEAD_MODE),
         scorer=cfg.get("scorer", DEFAULT_SCORER),
     ).to(dev)
     # strict=False is correct only for head-only payloads, where the encoder

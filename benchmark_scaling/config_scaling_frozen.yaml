@@ -20,6 +20,31 @@ prep_max_train: 400000
 prep_max_valid: 12000
 prep_max_test: 12000
 
+# LEARNING RATE: DELIBERATELY LEFT ON THE DEFAULT, AND THAT IS A MEASUREMENT.
+# A frozen cell trains the projection head and nothing else, so `train.default_lr`
+# hands it 1e-3. head_mode=separate (the default since 2026-09-21) triples the
+# head, which here means tripling the *entire trainable model* -- the largest
+# relative effect the head wiring has anywhere in this repo -- so the rate was
+# re-probed rather than assumed (benchmark_scaling/results/lr_probe_sep_frozen,
+# 2000 steps at B=256, these exact settings):
+#
+#                       1e-4    3e-4    1e-3    3e-3    1e-2
+#   mpnet              3.3916  3.3693 [3.3685] 3.3791  3.4013
+#   bert-multilingual  3.2445  3.2232 [3.2226] 3.2410  3.2265
+#   bge-large          3.2224  3.1888  3.2038 [3.1773] 3.1959
+#   xlm-roberta-large  3.2819 [3.2393] 3.2520  3.2445    --
+#   e5-mistral-7b      3.2485 [3.2402] 3.2665  3.2711    --
+#
+# **Nothing collapses, anywhere, across two decades**, and the whole spread per
+# row is 0.03-0.05 nats. Two of five land exactly on the 1e-3 default and the
+# other three beat it by 0.013-0.027 -- below the ~0.05 that a min-over-8-batch
+# statistic can resolve. So no per-cell rates are pinned here: writing them in
+# would be fitting noise and would imply a precision this probe does not have.
+# Contrast the fine-tuned sweep (config_scaling.yaml), where the same probe
+# found six of eight cells a decade off and three rates that collapse outright.
+# The difference is structural, not luck: head-only training is a small,
+# well-conditioned problem with no pretrained weights to destroy.
+#
 encoders:
   - mpnet                # 110M
   - bert-multilingual    # 178M

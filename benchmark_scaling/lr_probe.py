@@ -91,6 +91,13 @@ def run_one(encoder: str, lr: float, gpu: str, args: argparse.Namespace,
         "--ckpt-every", str(args.steps + 1),
         "--seed", str(args.seed),
     ]
+    # A frozen cell trains the head and nothing else, so `separate` triples
+    # the entire trainable model rather than a rounding error of it -- which
+    # is exactly why the frozen sweep needs its own probe rather than the
+    # fine-tuned one's rates. `--proj-dim` is already mandatory above, which
+    # is what keeps a frozen cell from degenerating to zero trainable params.
+    if args.freeze_encoder:
+        cmd.append("--freeze-encoder")
     # One probe cell per GPU means two trainers share the box. Left alone,
     # torch sizes its intra-op pool to every core in each process and they
     # spend the difference fighting each other.
@@ -155,6 +162,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--proj-dim", type=int, default=256)
     p.add_argument("--head", default="linear")
+    p.add_argument("--freeze-encoder", action="store_true",
+                   help="Probe frozen cells (head-only training). The rate that "
+                        "suits a head-only run is not the rate that suits a "
+                        "fine-tuned encoder, and head_mode=separate changes it "
+                        "again because the head IS the model here.")
     p.add_argument("--eval-every", type=int, default=600)
     p.add_argument("--valid-loss-batches", type=int, default=8)
     p.add_argument("--eval-n-triples", type=int, default=1000)

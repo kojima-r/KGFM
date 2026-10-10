@@ -279,8 +279,8 @@ print((h * r * t).sum(-1))   # 行ごとのスコア
 
 | モード | 中身 |
 |---|---|
-| `shared`（既定） | h, r, t を**同じヘッド**に通す。従来の唯一の挙動 |
-| `separate` | h, r, t に**専用ヘッド**。ヘッドのパラメータは 3 倍 |
+| `shared` | h, r, t を**同じヘッド**に通す |
+| `separate`（**既定**） | h, r, t に**専用ヘッド**。ヘッドのパラメータは 3 倍 |
 
 エンコーダの forward は両モードとも 1 回のままです（`encode_triple` の
 3B バッチはそのまま、ヘッドだけスライスごとに適用）。`separate` の追加コストは
@@ -291,6 +291,20 @@ print((h * r * t).sum(-1))   # 行ごとのスコア
 （既定 `role="t"` — 一括エンコードの呼び出し元はどれも候補 tail のバンクを
 作っているため）。比較するときは **`separate` がヘッド容量 3 倍**である点を
 必ず添えてください。詳細は `benchmark_scorer/README.md`。
+
+**既定は `separate` です。** 根拠は
+`benchmark_scorer` の本番結果で、`separate` が 4 つの scorer すべてで
+best validation loss を 0.16〜0.31 nats 改善したためです（DistMult で
+3.8972 → 3.6451）。**filtered MRR では逆に `shared` が勝っている**ので
+（distmult で −0.0171）、これは 2 つの指標のうち loss を採った選択です —
+スケーリング則の 2 つの study が当てはめているのが loss だからです。
+
+この変更には 2 つの実務上の含意があります。**(1) 旧チェックポイントは
+`shared` のまま読めます** — `heads.LEGACY_HEAD_MODE` が `head_mode` キーを
+持たない checkpoint を `shared` として復元するので、既存の成果物は壊れません。
+**(2) 学習率が変わります** — ヘッドが 3 倍になると最適 LR が上がり、
+再プローブで 14 セル中 9 セルが動きました（最大 10 倍）。`separate` で
+既存の config を回すときは LR を測り直してください。
 
 ### スコア関数 (`--scorer`)
 
@@ -360,7 +374,7 @@ bash benchmarks/run_chembl_xlarge_compare.sh --freezes on      # frozen のみ
 落とします。
 
 この 28 セルは実際に完走しており、結果は
-`benchmarks/results/chembl/20260811T230140Z_chembl_xlarge_compare/table.md`
+`benchmarks/results/chembl/` の 28 セル比較 run の `table.md`
 にあります（全 28 行 × 2 プロトコル）。filtered MRR の上位・下位はこうなりました。
 
 | 順位 | セル | filtered MRR |
@@ -500,7 +514,7 @@ L = -(1/B) Σ_i  log [ exp(S̃_ii) / Σ_j exp(S̃_ij) ]
 `contrastive` から正規化と温度を除いたもの。`kgfm/losses.py`（`--loss` の
 切り替え機構）が入る前は損失がこれ 1 つしかなく、**それ以前に取った結果は
 すべてこの目的関数で学習されたもの**です。`benchmarks/results/` にある
-2026-08-09 以前の run が該当します。
+`kgfm/losses.py` を入れる前の run が該当します。
 
 ```
 L = -(1/B) Σ_i  log [ exp(S_ii) / Σ_j exp(S_ij) ]
@@ -670,7 +684,7 @@ ChEMBL の TSV は activity ID で分割されているため、**1 ファイル
 `interleave_chunk`（64）行ずつ**全 train ファイルをラウンドロビンに**読みます
 (`interleave_files=True`)。
 
-これは 2026-08-25 に既定を変えた箇所です。それ以前は各ファイルを最後まで
+これは既定を変えた箇所です。旧挙動では各ファイルを最後まで
 読んでから次に移る実装でしたが、1 ファイルが 1000 万行あるので**どのファイルも
 読み終わりません** — 25k step / B=512 の run が worker あたり 320 万行しか
 引かないので、85 ファイル中 4 つの先頭 32% しか見ないことになります。学習
@@ -682,7 +696,7 @@ ChEMBL の TSV は activity ID で分割されているため、**1 ファイル
 混合で、先頭 2000 行の平均 tail 長は連結読みで 26.6（1 ファイル目そのものの
 値）、インターリーブで 39.7（2 ファイルの中間）でした。
 
-**`--no-interleave-files` は 2026-08-25 より前の run を再現するためだけの
+**`--no-interleave-files` はその旧挙動を再現するためだけの
 フラグ**です。新しく実験するときに渡す理由はありません。
 validation loss も既定でシャッフルしたストリーム上で測ります
 （`--no-valid-loss-shuffle` で無効化）— シャッフルしないと in-batch 負例が
@@ -692,8 +706,8 @@ validation loss も既定でシャッフルしたストリーム上で測りま�
 なお `kgfm eval` の候補プールと filter index (`eval.build_candidate_pool` /
 `build_filter_index`) も同じデータセットを使うため、プールが 1 ファイルの
 先頭からではなく全ファイルから引かれるようになります。より代表的になり
-ますが、**候補プールの中身が変わるので、2026-08-25 より前に取った評価値
-（`benchmarks/results/chembl/` の 20260816 以前の run）とは比較できません**。
+ますが、**候補プールの中身が変わるので、この既定より前に取った評価値とは
+比較できません**。`results/` に残っている run はすべて変更後のものです。
 
 ---
 
@@ -821,7 +835,7 @@ ls benchmarks/results/chembl/latest/
 ```
 
 **3 手法が同じ run に揃っている記録**は
-`benchmarks/results/chembl/20260808T073317Z_fulltest/table.md` です
+`benchmarks/results/chembl/` の 3 手法が揃った run の `table.md` です
 （`config_small.yaml` 相当: prep 50k / 2k / 2k、|E| = 72,669、
 inductive モード、kgfm は 200 step のみ）。
 
@@ -841,13 +855,19 @@ inductive モード、kgfm は 200 step のみ）。
 > 詳細は `benchmarks/README.md` の「test サンプル数 (`n_eval`) と評価指標への
 > 影響」を参照してください。
 
-**kgfm 本体の実力**は下記の 2 つの run です（どちらもベースライン行は
-含まれていません）。
+**kgfm 本体の実力**は `chembl_xxlarge` の run です
+（ベースライン行は含まれていません）。
 
 | run | 条件 | filtered MRR | pooled MRR |
 |---|---|---|---|
-| `20260811T230140Z_chembl_xlarge_compare` | 28 セル比較の最良（`gte-large` + `mlp`）、6,000 step | 0.4641 | 0.4929 |
-| `20260816T053252Z_chembl_xxlarge` | 同じセルで**全 674M 行を 1 エポック**（1,316,925 step） | 0.4410 | **0.5164** |
+| `chembl_xxlarge` | `gte-large` + `mlp` で**全 674M 行を 1 エポック**（1,316,925 step、2 GPU で 9 日） | 0.3942 | 0.4698 |
+
+この filtered MRR は**テスト tail が全件フィルタ語彙に入った状態**で測って
+います（`tails_outside_vocab = 0`、`filter_pairs = 9,059,458`）。つまり
+真の答えが約 900 万の実競合と同じ土俵に乗っており、**語彙から漏れた tail を
+別枠で足す測り方より厳密に難しい**値です。他所の filtered MRR と並べる前に
+`filter_pairs` と `tails_outside_vocab` を必ず突き合わせてください
+（`benchmarks/README.md`）。
 
 filtered が下がっているのは候補語彙が 419k → 1,563,335 と 3.7 倍になって
 分母が増えたためで、データ量の効果とは分離できていません。pooled は
@@ -888,6 +908,35 @@ bash benchmark_scaling/run_scaling_scratch.sh   # 本番（ランダム初期化
 落とし穴（学習率をサイズごとに振らないと指数が平坦化する、early stopping を
 入れてはいけない、など）は `benchmark_scaling/README.md` にまとめてあります。
 
+**現行結果**（`head_mode=separate`、7 サイズ × 48k step、全サイズ LR 再プローブ、
+`scaling_chembl`）: best validation loss は 29.2M で底を打ち
+（2.5010）、最終 test MRR は 110M が最良（0.5047）。**2 つの y 軸が別のサイズを
+選び、どちらでも最大の 335M は勝ちません。** 冪則は b = −0.0286 (R²=0.671)、
+床つきで L∞=2.436, b = −0.1823。ヘッド結線を変えただけで loss の最適サイズが
+**109.5M → 29.2M へ約 4 分の 1 に動いた**のがこの再実行でいちばん大きい変化です
+（ただし 2.5010 は min-of-192 のノイズの谷なので、0.05 nats 未満の差は
+この統計量では読めません）。
+
+ランダム多源コーパス `list_random` でも同じ軸を回してあり
+（`scaling_random`）、予算をそろえると b = −0.0097
+(R²=0.158) 対 ChEMBL −0.0244 (R²=0.666) で、**このコーパスではサイズ軸が
+ほとんど効きません**（最適は 11.4M）。
+
+**事前学習済みモデルの軸**（`scaling_pretrained`、9 セル × 4,000 step）。
+このスイープは長らく「`C^-0.0186`、R²=0.40 = 法則が見えない」と報告されて
+いましたが、**セルごとの学習率が設定されておらず全セルが既定の 3e-5 で
+回っていた**ことが分かりました。実測すると 8 セル中 6 セルで 1 桁低すぎ
+（0.12〜0.27 nats 損）、しかも**誤差は小さいモデルほど大きい**という、
+サイズ軸を平坦化させる最悪のパターンでした。実測レートで回し直すと
+b=−0.0309 **R²=0.871**、BERT 系統に絞れば b=−0.0343 **R²=0.964**。
+系統内の指数はほぼ不変で R² だけが跳ねており、**傾きを隠していた
+ばらつきが消えた**というのが正しい読み方です。
+
+**凍結エンコーダ軸**（`scaling_frozen`、110M〜7.1B）は
+本当に平坦でした: b=−0.0068 (R²=0.151)。**7.1B の凍結エンコーダは 335M の
+`bge-large` より悪く**（3.2621 対 3.1844）、計算量は 35 倍です。凍結時は
+エンコーダサイズが性能をほとんど決めていません。
+
 ---
 
 ## データ量に対するスケーリング則 (`benchmark_scaling_data/`)
@@ -913,11 +962,12 @@ bash benchmark_scaling_data/run_data_scratch.sh  # 41M transformer 8 セル（�
 そのセルの best validation loss）で、軌跡は「小さい D のセルが途中で折れ返る」
 ことを示すのに使います。
 
-**両方の本番スイープは実行済み**です。ユニークデータを 8,500 → 774 万行と
-振ると、best validation loss は ngram で 4.6147 → 3.6738、`scratch-medium`
-(41M) で 3.4253 → 2.9357 まで下がります。指数は **−0.0339 (R²=0.980)** と
-**−0.0280 (R²=0.960)**。過学習の機序も直接見えていて、D が小さいほど最適点が
-早く来て（step 250 → 15,500）その後の悪化が大きくなります（+1.23 → +0.08 nats）。
+**両方の本番スイープが完走しています**（`data_ngram` / `data_scratch`）。
+ユニークデータを 8,500 → 774 万行と振ると、best validation loss は ngram で
+4.7824 → 3.3458、`scratch-medium` (41M) で 3.3908 → 2.7414 まで下がります。
+D 拘束セルでの指数は **−0.0527 (R²=0.963)** と **−0.0393 (R²=0.942)**。
+過学習の機序も直接見えていて、D が小さいほど最適点が早く来て
+その後の悪化が大きくなります（ngram で step 250 → 15,500、+1.06 → +0.02 nats）。
 実測表・落とし穴（1 パスに届かないセルを混ぜると指数が半分になる、
 `max_rows_per_file` は先頭 D 行でランダム標本ではない、など）は
 `benchmark_scaling_data/README.md` にあります。

@@ -1,7 +1,7 @@
 """Run directories and step logging.
 
 A benchmark *run* is a directory under ``benchmarks/results/chembl/`` named by
-UTC timestamp (plus an optional label). Everything about the run lands in it:
+experiment name. Everything about the run lands in it:
 meta.json, one JSON per method, table.md, checkpoints, and logs.
 
 ``RunLogger`` reproduces what the old shell `run_step` did — stream a child's
@@ -240,13 +240,38 @@ def sanitize_label(label: str) -> str:
     return "".join(c if (c.isalnum() or c in "._-") else "_" for c in label)
 
 
+ARCHIVE_DIR = ".archive"
+
+
 def create_run_dir(results_root: os.PathLike | str, label: str = "") -> Path:
-    """Make a fresh ``<ts>[_<label>]`` run dir and repoint ``latest`` at it."""
+    """Make a fresh ``<label>`` run dir and repoint ``latest`` at it.
+
+    A run directory is named for its **experiment**, not for the minute it
+    started. One experiment therefore has exactly one visible directory, and
+    `results/<study>/` lists the studies rather than a pile of timestamps that
+    all have to be opened to find out which is which. The timestamp is not
+    lost: `meta.json` records `timestamp_utc`, which is where it belongs,
+    since it is provenance rather than identity.
+
+    Re-running an experiment must not silently mix two runs. Per-step logs are
+    opened for append (see RunLogger) and `kgfm report` / `kgfm scaling` parse
+    the training curves back out of them, so a second run writing into the
+    first one's directory would produce a report interleaving both. An
+    existing non-empty directory is therefore rotated into ``.archive/`` --
+    dot-prefixed so it stays out of the listing -- rather than reused or
+    deleted. Nothing is destroyed and nothing scatters.
+
+    Use ``--resume`` to continue a run; that path goes through
+    ``resolve_run_dir`` and never calls this function.
+    """
     root = Path(results_root)
     root.mkdir(parents=True, exist_ok=True)
-    label = sanitize_label(label or "")
-    name = utc_stamp() + (f"_{label}" if label else "")
+    name = sanitize_label(label or "") or utc_stamp()
     out_dir = root / name
+    if out_dir.exists() and any(out_dir.iterdir()):
+        archive = root / ARCHIVE_DIR
+        archive.mkdir(parents=True, exist_ok=True)
+        out_dir.rename(archive / f"{name}-{utc_stamp()}")
     out_dir.mkdir(parents=True, exist_ok=True)
     latest = root / "latest"
     if latest.is_symlink() or latest.exists():
@@ -286,9 +311,15 @@ def read_commands(out_dir: os.PathLike | str) -> List[dict]:
 
 
 def run_timestamp(out_dir: Path) -> str:
-    """Recover the bare UTC timestamp from a run dir name.
+    """The UTC stamp for a run.
 
-    The timestamp itself contains no underscore, so anything from the first
-    underscore on is the label the wrapper attached.
+    Run directories are named for their experiment and carry no timestamp, so
+    this is generated at call time for whatever is about to be written (it
+    feeds `meta.json`'s `timestamp_utc`). Directories created before the
+    name-only scheme began with `<ts>_`, so that prefix is still honoured when
+    present and one of those older runs is re-read.
     """
-    return out_dir.name.split("_", 1)[0]
+    head = out_dir.name.split("_", 1)[0]
+    if len(head) == 16 and head.endswith("Z") and head[:8].isdigit():
+        return head
+    return utc_stamp()

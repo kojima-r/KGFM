@@ -48,8 +48,24 @@ HEADS = ("auto", "identity", "linear", "mlp", "residual_mlp")
 # unless the comparison holds the parameter budget in mind. The benchmark in
 # benchmark_scorer/ reports head parameter counts next to the metrics for
 # exactly that reason.
+# Default flipped to `separate` on 2026-09-21 on the evidence of
+# benchmark_scorer/results/chembl/20260909T035740Z_scorer: `separate` gave a
+# better best validation loss for all four scorers (0.16-0.31 nats; with
+# distmult 3.8972 -> 3.6451), which is the axis both scaling studies fit. Note
+# the two metrics disagree on this exact cell -- filtered MRR preferred
+# `shared` for the inner-product scorers (distmult -0.0171) -- so this is a
+# choice of the loss winner, not a clean sweep.
 HEAD_MODES = ("shared", "separate")
-DEFAULT_HEAD_MODE = "shared"
+DEFAULT_HEAD_MODE = "separate"
+# What a checkpoint that predates the `head_mode` option actually was, which
+# is NOT the same question as what a new run should default to. Checkpoints
+# store `cfg.__dict__`, so anything trained before the option existed has no
+# `head_mode` key at all and carries `proj.weight` / `proj.bias`; resolving
+# that absence through DEFAULT_HEAD_MODE would reconstruct a `proj_by_role.*`
+# model and fail the strict state-dict load -- silently rewriting history for
+# every result in the tree. The checkpoint readers must use this constant and
+# it must never track DEFAULT_HEAD_MODE.
+LEGACY_HEAD_MODE = "shared"
 ROLES = ("h", "r", "t")
 # "auto" is what DistMultScorer always did: a Linear when proj_dim actually
 # changes the width, nn.Identity when it does not. It stays the default so

@@ -98,11 +98,59 @@ defaults:
   max_filter_tails: 460000
   max_filter_rows: 10000000
 
+# PER-CELL LEARNING RATES, MEASURED under head_mode=separate on 2026-09-23
+# (benchmark_scaling/lr_probe.py, 2000 steps at B=256, these exact cell
+# settings). Every value below is an interior optimum, not a grid edge.
+#
+# THIS TABLE DID NOT EXIST BEFORE, AND ITS ABSENCE MATTERED. Until now this
+# sweep ran every cell on `train.default_lr` (3e-5 for a fine-tuned
+# transformer), with only xlm-roberta-large pinned lower for stability. The
+# probe says 3e-5 is wrong for six of the eight cells, by roughly a decade:
+#
+#                     3e-6    1e-5    3e-5    1e-4    3e-4    1e-3    3e-3
+#   bert-tiny           --   3.6342  3.4343  3.2806  3.2588 [3.1682]  coll
+#   bert-mini           --   3.4559  3.3411  3.2413 [3.0741]  coll    coll
+#   bert-small          --   3.3597  3.1990 [3.0177] 3.0536    --      --
+#   bert-medium         --   3.2979  3.1171 [2.9966]  coll     --      --
+#   mpnet             3.4196 3.3858  3.1582 [2.9125]  coll     --      --
+#   bert-multilingual 3.4314 3.1820  2.9549 [2.8268]  coll     --      --
+#   bge-large         3.4021 3.2990 [2.9619] 2.9779    --      --      --
+#   xlm-roberta-large 3.3804[3.2944]  coll     --      --      --      --
+#
+# The cost of the old default was 0.12-0.27 nats per cell -- two to five times
+# what this statistic can resolve -- and it was **largest at the small end**
+# (tiny 0.266, mini 0.267, mpnet 0.246). A size axis mis-tuned hardest on its
+# smallest models is flattened at exactly the place that sets the exponent.
+# benchmark_scaling/README.md records this sweep's archived result as
+# `C^-0.0186` at R^2=0.40, "which reads as no scaling law here", and attributes
+# the flatness to the loss ceiling, to pooling recipes, and to a power law that
+# cannot bend. The learning rate was a fourth cause and is the one that was
+# never checked. Compare against the separate-head re-run before quoting
+# either number.
+#
+# Selection is on validation loss, per benchmark_scaling/README.md.
 cells:
   # ngram's EmbeddingBag *is* its encoder and trains from scratch; decaying it
-  # would change the baseline rather than regularize a pretrained model.
+  # would change the baseline rather than regularize a pretrained model. Its
+  # rate stays the ngram default (1e-3); it is not on the compute axis anyway,
+  # because an EmbeddingBag lookup is not 6ND FLOPs.
   ngram:
     encoder_weight_decay: 0.0
+
+  bert-tiny:
+    lr: 1.0e-3
+  bert-mini:
+    lr: 3.0e-4
+  bert-small:
+    lr: 1.0e-4
+  bert-medium:
+    lr: 1.0e-4
+  mpnet:
+    lr: 1.0e-4
+  bert-multilingual:
+    lr: 1.0e-4
+  bge-large:
+    lr: 3.0e-5
 
   # xlm-roberta-large is unstable at the 3e-5 default: it falls into the
   # collapsed fixed point (all embeddings identical -> every logit equal ->

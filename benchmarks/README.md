@@ -191,12 +191,12 @@ kgfm bench configs                       # 同梱の設定ファイル一覧と�
 
 | ファイル | 用途 | 実測ベースの見積 (H200 x1) | 完走済みの run |
 |---|---|---|---|
-| `config_small.yaml` | スモークテスト | 約 0.5 時間 | `20260808T073317Z_fulltest`（3 手法揃い） |
+| `config_small.yaml` | スモークテスト | 約 0.5 時間 | — |
 | `config_middle.yaml` | 中規模 | 約 4.3 時間（6 時間枠） | — |
-| `config_large.yaml` | 論文掲載レベル | 約 10.8 時間（12 時間枠） | `20260809T051610Z_chembl_large` |
-| `config_xlarge.yaml` | 論文掲載レベル・最大 | 約 21.4 時間（24 時間枠） | `20260808T114948Z_chembl_xlarge` |
-| `config_xlarge_compare.yaml` | アーキテクチャ比較（28 セル） | 約 19 時間（学習 15.9h + 評価 3h） | `20260811T230140Z_chembl_xlarge_compare` |
-| `config_xxlarge.yaml` | **全 674M 行を 1 エポック**（gte-large + mlp） | 約 10.4 日（2 GPU で 5.2 日） | `20260816T053252Z_chembl_xxlarge` |
+| `config_large.yaml` | 論文掲載レベル | 約 10.8 時間（12 時間枠） | — |
+| `config_xlarge.yaml` | 論文掲載レベル・最大 | 約 21.4 時間（24 時間枠） | — |
+| `config_xlarge_compare.yaml` | アーキテクチャ比較（28 セル） | 約 19 時間（学習 15.9h + 評価 3h） | — |
+| `config_xxlarge.yaml` | **全 674M 行を 1 エポック**（gte-large + mlp） | 2 GPU で約 9 日 | **`chembl_xxlarge`** |
 
 「完走済みの run」は `benchmarks/results/chembl/<名前>/` です。それぞれ
 `table.md`（結果）・`meta.json`（実行条件）・`commands.jsonl`（実行した
@@ -206,13 +206,13 @@ kgfm bench configs                       # 同梱の設定ファイル一覧と�
 `meta.json` の `git_rev` で判別できます）。
 
 - **損失関数の既定**: `kgfm/losses.py` が入ったのはコミット `3e23a11`
-  (2026-08-09) です。それ以前の `git_rev` を持つ run
+  です。それ以前の `git_rev` を持つ run
   （`_fulltest` / `_chembl_xlarge` / `_chembl_large` = いずれも `0fabff5`）は
   唯一の目的関数だった **`softmax_ce`** で学習されており、`_xlarge_compare`
   以降は **`contrastive`** です。損失の絶対値はまたいで比較できません
   （MRR / Hit@k は行ごとの単調変換に不変なので比較できます）。
 - **データ読み出し順**: ファイルのラウンドロビン読み (`interleave_files`)
-  を既定にしたのは 2026-08-25 で、**上表のどの run よりも後**です。つまり
+  を既定にした変更は、**上表のどの run よりも後**です。つまり
   既存の結果はすべて「1 ファイルを読み切ってから次へ」の順序で学習され、
   評価の候補プールも先頭ファイル寄りに偏っています。今から回す run とは
   評価値を直接比較できません。
@@ -328,7 +328,7 @@ steps = ceil(max_epoch × epoch_examples / (batch_size × nproc × grad_accum))
 「性能優先か時間優先か」で、既定は**性能優先**にしてあります。
 
 なお 25k step の large 実行
-（`benchmarks/results/chembl/20260809T051610Z_chembl_large/`）では fine-tune
+（`config_large.yaml` 規模の run）では fine-tune
 した transformer が過学習しました（train loss は下がり続けるのに valid loss が
 step 12.5k で底を打って上昇）。これは行の反復による暗記ではありません
 （0.05 エポック未満なので同じ行は二度と現れない）— 到達できた数ファイルへの
@@ -337,7 +337,7 @@ step 12.5k で底を打って上昇）。これは行の反復による暗記で
 
 ##### 実行結果（完走済み）
 
-`benchmarks/results/chembl/20260816T053252Z_chembl_xxlarge/` が、この config を
+`benchmarks/results/chembl/chembl_xxlarge/` が、この config を
 `--nproc 2` で**実際に 1 エポック完走させた**記録です。
 
 | | 値 |
@@ -396,7 +396,7 @@ bash benchmarks/run_chembl_xlarge_compare.sh --encoders ngram,bge-large --heads 
 初回ダウンロードが発生します。
 
 **結果は
-`benchmarks/results/chembl/20260811T230140Z_chembl_xlarge_compare/table.md`
+28 セル比較 run の `table.md`
 にあります。** filtered MRR の 1 位は `gte-large` + `mlp` + fine-tune で
 0.4641、最下位は `ngram` + `mlp` の 0.2539、`ngram` + `linear` は 0.4331 で
 5 位です。`config_xxlarge.yaml` が `gte-large` + `mlp` を既定にしているのは
@@ -414,7 +414,7 @@ bash benchmarks/run_chembl_large_2gpu.sh    # config_large.yaml  + --nproc 2
 bash benchmarks/run_chembl_xlarge_2gpu.sh   # config_xlarge.yaml + --nproc 2
 ```
 
-> **2026-08-16 より前の 2 GPU 実行結果は信用できません。** それ以前の
+> **DDP の勾配集約を直す前の 2 GPU 実行結果は信用できません。** 修正前の
 > `--nproc 2` 実行は **DDP の勾配同期が全く効いておらず**、2 つの独立した
 > モデルを学習して rank 1 の結果を捨てていました。原因は
 > `in_batch_negative_loss` が `DistributedDataParallel` のラッパではなく
@@ -467,7 +467,7 @@ defaults:
 = 120`、NCCL の既定は 10 分）。評価とチェックポイント書き出しは rank 0 だけで
 走り、その間ほかの rank は `barrier()` で待つので、大きな tail 語彙に対する
 filtered 評価は 10 分を普通に超えます。実際に既定の 10 分だと
-`20260813T093403Z_chembl_xxlarge` が step 131k で
+1 エポック run が step 131k で
 `Watchdog caught collective operation timeout ... ran for 600068 milliseconds`
 を出して死にました（`cell_pooled_gte-large.log` に残っています）。**遅い評価を
 クラッシュに変えないための設定**で、性能とは無関係です。
@@ -478,7 +478,7 @@ filtered 評価は 10 分を普通に超えます。実際に既定の 10 分だ
 呼びません。すると勾配を受け取らないパラメータが残り、
 `find_unused_parameters=False`（既定）の DDP では 2 step 目で
 `Expected to have finished reduction in the prior iteration` になって
-**落ちます**（実例: `20260816T052044Z_chembl_xxlarge` が
+**落ちます**（実例: 1 エポック run が
 `Parameter indices which did not receive grad: 389 390` で終了）。
 `requires_grad=False` にするのが正確な対処で、`add_pooling_layer=False` と
 違って重みは state_dict に残るのでチェックポイントの互換性も保てます。
@@ -767,7 +767,7 @@ bash benchmarks/run_chembl_large.sh --prep-max-train 6700000   # ベースライ
   `ngram` の `"on"` は「凍結できる LM が無い」ので `cell_specs()` が
   自動的に落とします。
 - **`cells:` で fine-tune セルだけに `encoder_weight_decay: 0.01`** を
-  かけています。この run（`benchmarks/results/chembl/20260809T051610Z_chembl_large/`）
+  かけています。この run（`config_large.yaml` 規模）
   で、fine-tune した transformer は train loss が 2.25 → 1.97 と下がり続ける
   一方 valid loss が step 12.5k を底に上昇したのに対し、head しか学習しない
   frozen セルでは同じ現象が起きなかったためです。frozen セルの方は
@@ -1193,17 +1193,14 @@ filter ファイル側とは別の集団だからです。語彙に無い真の 
 
 ## 動作確認時の実測値（3 手法が同じ run で揃っている唯一の記録）
 
-出典は `benchmarks/results/chembl/20260808T073317Z_fulltest/table.md` です。
+出典は 3 手法が揃った run の `table.md` です。
 データ: `kgfm bench prep --prep-max-train 50000 --prep-max-valid 2000
 --prep-max-test 2000`（|E| = 72,669, |R| = 22, inductive モード）、kgfm は
 200 steps。**これは「3 手法が同じ実行ディレクトリで動くこと」を確認するための
 スモークで、kgfm の性能を示す数字ではありません** — kgfm 側は 200 step
 （`config_small.yaml`）しか学習していません。kgfm の実力は
-`20260811T230140Z_chembl_xlarge_compare`（6,000 step、filtered MRR 最良
-0.4641）と `20260816T053252Z_chembl_xxlarge`（1 エポック、filtered 0.4410 /
-pooled 0.5164）を見てください。ただし**それらの run には ULTRA / MOTIF の行が
-ありません**（ベースラインは prep された KG を読むので、`kgfm-ultra` /
-`kgfm-motif` を同じディレクトリに後から足すことは可能です）。
+28 セル比較の最良セル（`gte-large` + `mlp`、6,000 step）と、同じセルを
+1 エポック回した `chembl_xxlarge` の 2 本が kgfm 側の代表値です。
 
 | 手法 | Protocol | MRR | Hit@1 | Hit@3 | Hit@10 | MR | n_eval |
 |---|---|---|---|---|---|---|---|
@@ -1221,9 +1218,8 @@ pooled 0.5164）を見てください。ただし**それらの run には ULTRA
 > pooled 0.9330 / filtered 0.0004 という無意味な値を出していました。
 > 両方の詳細は後述の「学習率はエンコーダごとに決まります」と
 > 「評価指標の注意点: 同順位の扱い」にあります。
-> **`benchmarks/results/chembl/` の 2026-06 以前の run（`20260522T101455Z` の
-> transformer 行 0.8686 など）はこの崩壊状態の値**なので、参照しないで
-> ください。
+> 崩壊した run の数値（pooled 0.93 / filtered 0.0004 のような組）は
+> この症状なので、見かけたら参照しないでください。
 
 - ULTRA / MOTIF の値は、この 2 つを `kgfm/baselines/` に切り出すリファクタの
   前後で完全に一致しています（同じ結果が再現されることの確認）。
@@ -1249,7 +1245,7 @@ pooled 0.5164）を見てください。ただし**それらの run には ULTRA
 | `--loss` | 内容 |
 |---|---|
 | `contrastive` **(既定)** | InfoNCE / NT-Xent（正規化 cosine を温度で割る） |
-| `softmax_ce` | 生スコアの softmax 交差エントロピー（`kgfm/losses.py` を入れる前の唯一の目的関数。2026-08-09 より前の run はすべてこれ） |
+| `softmax_ce` | 生スコアの softmax 交差エントロピー（`kgfm/losses.py` を入れる前の唯一の目的関数） |
 | `bce` | 候補ごとの二値交差エントロピー（ConvE の 1-N scoring） |
 | `margin` | max-margin ヒンジ（TransE 系） |
 | `self_adversarial` | RotatE の self-adversarial negative sampling |
@@ -1260,7 +1256,7 @@ pooled 0.5164）を見てください。ただし**それらの run には ULTRA
 または YAML の `loss:` / `loss_temperature:` で指定できます。
 
 ```bash
-kgfm bench run --config large --loss softmax_ce   # 2026-08-09 より前の挙動で回す
+kgfm bench run --config large --loss softmax_ce   # 旧既定の挙動で回す
 ```
 
 ### 学習率はエンコーダごとに決まります
@@ -1287,7 +1283,7 @@ cos 類似度 0.95 (BERT 本来の異方性の範囲) と正常に学習しま�
 **厳密に大きい**スコアの数 + 1」と定義しますが、この定義だと**全候補の
 スコアが同じモデル（= 崩壊したモデル）が全候補について rank 1、つまり
 MRR = 1.0 を取ってしまいます**。仮定ではなく実際に起きていて、
-`benchmarks/results/chembl/20260606T090031Z/table.md` の transformer 行が
+初期の run の transformer 行が
 filtered で `1.00` を報告しています。
 
 現在は KG 完成タスクの標準である**同順位の平均**（楽観順位と悲観順位の
@@ -1417,13 +1413,13 @@ benchmarks/                 # シェルは薄いラッパのみ
 ├── chembl_kg/              # 生成 KG (gitignore)
 └── results/                # gitignore
     └── chembl/
-        ├── 20260507T1234Z_chembl_large/   # 実行ごとの記録
+        ├── chembl_xxlarge/                # 実験名 1 つにつき 1 ディレクトリ
         │   ├── meta.json
         │   ├── kgfm_<protocol>_<encoder>.json / ultra.json / motif.json
         │   ├── table.md / report.html
         │   ├── run.log + 各ステップログ
         │   └── kgfm_ckpts_<encoder>/
-        └── latest -> 20260507T1234Z_chembl_large
+        └── latest -> chembl_xxlarge
 ```
 
 ---

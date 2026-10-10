@@ -118,42 +118,63 @@ defaults:
   max_filter_tails: 460000
   max_filter_rows: 10000000
 
-# Per-size learning rates, MEASURED, not assumed. `benchmark_scaling/
-# run_lr_probe.sh` + `run_lr_probe_extend.sh` swept 3e-6 … 3e-3 at these exact
-# cell settings (2000 steps, B=256); every value below is an interior optimum,
-# not a grid edge. Selected on validation loss — a rate is tuned against what
-# the optimizer minimizes; the probe's MRR column is a cross-check only.
+# Per-size learning rates, MEASURED, not assumed, and RE-MEASURED under
+# head_mode=separate. `benchmark_scaling/lr_probe.py` swept these exact cell
+# settings (2000 steps, B=256) on 2026-09-21; every value below is an interior
+# optimum, not a grid edge. Selected on validation loss — a rate is tuned
+# against what the optimizer minimizes; the probe's MRR column is a
+# cross-check only.
 #
-# Best validation loss per (size, rate). `collapse` = within 0.5% of
-# ln(256)=5.5452, i.e. the model never left the random-guess fixed point:
+# THE RATES ARE NOT THE SHARED-HEAD ONES, AND THAT IS THE POINT. Flipping the
+# default head_mode to `separate` (kgfm/heads.py, 2026-09-21) gives each of
+# h/r/t its own projection, tripling the head. Re-probing moved four of the
+# seven rates, `mini` and `small` by a full decade:
 #
-#                 3e-6    1e-5    3e-5    1e-4    3e-4    1e-3    3e-3
-#   tiny            --   3.7627  3.3230 [3.1892] 3.2286  3.6682   coll
-#   mini            --   3.4016 [3.1677] 3.2167  3.3257   coll     coll
-#   small        3.5940 [3.2068] 3.2117  3.5207   coll    coll     coll
-#   medium          --   3.1837 [3.1714] 3.2959   coll    coll     coll
-#   base         3.2942 [3.1200] 3.3400   coll    coll    coll     coll
-#   xl           3.2386 [3.1995]  coll    coll    coll    coll     coll
-#   large*      [3.2652] 3.3188   coll    coll    coll    coll     coll
+#             shared    separate
+#   tiny       1e-4       1e-4
+#   mini       3e-5       3e-4      <- 10x
+#   small      1e-5       1e-4      <- 10x
+#   medium     3e-5       3e-5
+#   base       1e-5       3e-5      <- 3x
+#   xl         1e-5       1e-5
+#   large      3e-6       1e-5      <- 3x
 #
-#   * scratch-large was swept on its own grid (1e-6 3.5462, 3e-6 3.2652,
-#     1e-5 3.3188, 3e-5 collapse), so its 3e-6 column has no counterpart
-#     above; the value is interior on that grid, and loss and MRR agree
-#     on it (MRR 0.3331 / 0.4204 / 0.4019 / collapse).
+# Reusing the shared-head rates would have run four cells at a third to a
+# tenth of their optimum — the same confound this table exists to remove,
+# reintroduced by a change to a different part of the model. A rate is a
+# property of (architecture, corpus, head wiring), not of size alone.
+#
+# Best validation loss per (size, rate) under separate. `collapse` = within
+# 0.5% of ln(256)=5.5452, i.e. never left the random-guess fixed point:
+#
+#                 1e-6    3e-6    1e-5    3e-5    1e-4    3e-4    1e-3    3e-3
+#   tiny            --   4.4883  3.7472  3.3867 [3.1749] 3.1955   --      --
+#   mini            --   3.9468  3.5038  3.1926  3.1627 [3.1212]  coll    coll
+#   small           --   3.6810  3.2329  3.1715 [3.1533]  coll    --      --
+#   medium          --   3.5902  3.1712 [3.1217] 3.1337   coll    --      --
+#   base            --   3.3414  3.1452 [3.1209]  coll    coll    --      --
+#   large        3.5421  3.2240 [3.0958]  coll    coll    --      --      --
+#   xl              --   3.2332 [3.1718]  coll    --      --      --      --
 #
 # WHY THIS MATTERS MORE THAN A USUAL HYPERPARAMETER TABLE. `train.SCRATCH_LR`
-# is 1e-4, and at 1e-4 `scratch-base` **collapses outright** while
-# `scratch-small` lands 0.31 nats off its own optimum. Run on the single
-# default, this study's largest cell would have sat on the random-guess line
-# and the size axis would have reported "capacity does not help" — the flat
-# exponent would have been an artifact of the learning rate, not a measurement.
-# At its own rate `scratch-base` is instead the *best* cell in the sweep
-# (3.1200, better than every smaller size), which is what the size axis is
-# supposed to show.
+# is 1e-4, and under separate that rate collapses `base`, `large` and `xl`
+# outright. Run on the single default, this study's three largest cells would
+# have sat on the random-guess line and the size axis would have reported
+# "capacity does not help" — a flat exponent manufactured by the learning
+# rate, not a measurement.
 #
-# The tolerated rate falls with size but not smoothly: small and medium share
-# a collapse threshold, and medium trains better at it (3.1714 vs 3.2068) —
-# they differ mostly in depth (8x512 vs 4x512), not parameter count.
+# Note what separate changed about the *shape* of the axis, not just the
+# rates: at 2000 steps `scratch-large` is now the best cell on the grid
+# (3.0958), where under shared it was among the worst (3.2652, behind base's
+# 3.1200). Do not read that as "large wins" — a 2000-step probe brackets the
+# rate and does not rank sizes, and from random init a bigger model spends
+# more of a short probe in its transient. The 48k-step run is the ranking.
+#
+# The tolerated rate still falls with size but not smoothly: base and medium
+# share an optimum (3e-5) and base is marginally better at it (3.1209 vs
+# 3.1217), while xl tolerates less than the larger `large` does — xl
+# collapses at 3e-5 where large only collapses there too but peaks higher, at
+# 1e-5. Depth and width do not trade off cleanly on this axis.
 #
 # DO NOT ADD EARLY STOPPING HERE. Measured on the 2026-08-26 run: validation
 # loss for the two largest cells is *two-phase* — it falls, rises for several
@@ -167,22 +188,20 @@ cells:
   scratch-tiny:
     lr: 1.0e-4
   scratch-mini:
-    lr: 3.0e-5
+    lr: 3.0e-4
   scratch-small:
-    lr: 1.0e-5
+    lr: 1.0e-4
   scratch-medium:
     lr: 3.0e-5
   scratch-base:
-    lr: 1.0e-5
-  # Interior optimum, same grid as the others: 3e-6 -> 3.2386,
-  # 1e-5 -> 3.1995, 3e-5 -> collapse (ln(256)=5.5452).
+    lr: 3.0e-5
+  # Interior, same grid as the others: 3e-6 -> 3.2332, 1e-5 -> 3.1718,
+  # 3e-5 -> collapse (ln(256)=5.5452). Unmoved by the shared->separate flip.
   scratch-xl:
     lr: 1.0e-5
-  # Interior on its own grid: 1e-6 -> 3.5462, 3e-6 -> 3.2652, 1e-5 -> 3.3188,
-  # 3e-5 -> collapse. Note this cell's best-at-2000-steps (3.2652) is WORSE
-  # than scratch-base's (3.1200) and scratch-xl's (3.1995). That is what a
-  # short probe looks like from random init -- a bigger model spends more of
-  # 2000 steps in its transient -- and is exactly why the probe is a bracket
-  # for the rate, not a ranking of the sizes. The 48k-step run is the ranking.
+  # Interior: 1e-6 -> 3.5421, 3e-6 -> 3.2240, 1e-5 -> 3.0958, and both
+  # 3e-5 and 1e-4 collapse. Moved 3x by the shared->separate flip (was 3e-6);
+  # the header block explains why the probe's ordering of the sizes here is
+  # not a ranking of them.
   scratch-large:
-    lr: 3.0e-6
+    lr: 1.0e-5

@@ -86,7 +86,25 @@ defaults:
   # pool the batches are drawn from differs.
   max_steps: 20000        # x 512 = 10,240,000 examples per cell
   batch_size: 512
-  proj_dim: 256           # collapses to Identity at ngram's own width, so free
+  proj_dim: 256           # explicit Linear via heads:[linear], 3x under separate
+
+  # MEASURED, not the default. ngram had only ever used `train.default_lr`'s
+  # 1e-3, which was never probed for either head wiring; head_mode=separate
+  # (the default since 2026-09-21) triples the head, so the rate had to be
+  # established rather than inherited. Probed at THESE settings (B=512,
+  # ChEMBL, linear head, proj 256, encoder_weight_decay 0, 2000 steps,
+  # uncapped data) -- benchmark_scaling/results/lr_probe_sep_data_ngram:
+  #
+  #        1e-4     3e-4     1e-3     3e-3     1e-2
+  #       4.1304   3.9914   3.8345  [3.7611]  3.8014
+  #
+  # Interior, and the old 1e-3 default sits 0.073 nats off it. Loss and MRR
+  # disagree (MRR peaks at 1e-3, 0.5383 vs 0.5242); selection is on loss,
+  # both by the convention in benchmark_scaling/README.md and because
+  # report_data.py fits validation loss as its primary axis. One rate for
+  # every cell is required -- varying it with D would confound the axis --
+  # so it is probed once, uncapped, and held fixed.
+  lr: 3.0e-3
 
   # These ARE the data points the trajectories are read from, so they are
   # dense. `valid_loss_batches > 0` is mandatory: it is the y-axis.
